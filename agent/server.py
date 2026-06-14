@@ -20,7 +20,10 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-from agent.graph import AgentState, graph  # noqa: E402
+from agent.graph import MAX_ITERATIONS, VLLM_MODEL, AgentState, graph  # noqa: E402
+
+# Short model id for tags (drop the HF org prefix), e.g. "Qwen3-30B-A3B-Instruct-2507".
+_MODEL_SHORT = VLLM_MODEL.rsplit("/", 1)[-1]
 
 # Langfuse tracing. With keys set we initialize the LangChain callback handler
 # (langfuse 4.x imports it from langfuse.langchain) and keep a client handle so
@@ -90,6 +93,40 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _trace_metadata(req: AnswerRequest) -> dict[str, Any]:
+    """Build Langfuse trace shaping for one request.
+
+    The goal is Phase-6-grade analysis: every trace should say *which run, under
+    what load, against which DB, and on what configuration* it was produced, so
+    you can filter/group/compare iterations directly in the Langfuse UI.
+
+    Caller-supplied tags (e.g. {"run": "iter1-pooled", "rps": "10",
+    "phase": "load_test"}) become both filterable tag chips ("run:iter1-pooled")
+    and structured metadata. We also stamp the server-side config (model,
+    MAX_ITERATIONS) so a tuning change is visible per-trace, and group a whole
+    run into one Langfuse session via session_id/run/phase.
+    """
+    tags: list[str] = ["sql-agent", "text-to-sql", f"db:{req.db}",
+                       f"model:{_MODEL_SHORT}", f"max_iter:{MAX_ITERATIONS}"]
+    tags += [f"{k}:{v}" for k, v in req.tags.items() if v]
+
+    metadata: dict[str, Any] = {
+        **req.tags,
+        "db_id": req.db,
+        "model": VLLM_MODEL,
+        "max_iterations": MAX_ITERATIONS,
+        # Reserved Langfuse keys consumed by the LangChain callback handler.
+        "langfuse_trace_name": "sql-agent",
+        "langfuse_tags": tags,
+    }
+    # Group all traces from one load-test / eval run under a single session so
+    # you can open it and see the whole run's latency distribution at once.
+    session_id = req.tags.get("session_id") or req.tags.get("run") or req.tags.get("phase")
+    if session_id:
+        metadata["langfuse_session_id"] = session_id
+    return metadata
+
+
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
     # outcome/latency/in-flight are recorded in finally so every path - including
@@ -99,21 +136,9 @@ def answer(req: AnswerRequest) -> AnswerResponse:
     AGENT_INFLIGHT.inc()
     try:
         state = AgentState(question=req.question, db_id=req.db)
-        # Best-practice trace shaping via Langfuse's reserved metadata keys: a stable
-        # trace name, tags for filtering, the db under test, and a session id (the
-        # caller's "phase" tag by default) so a whole eval/load run groups together.
-        metadata: dict[str, Any] = {
-            **req.tags,
-            "langfuse_trace_name": "sql-agent",
-            "langfuse_tags": ["sql-agent", "text-to-sql"],
-            "db_id": req.db,
-        }
-        session_id = req.tags.get("session_id") or req.tags.get("phase")
-        if session_id:
-            metadata["langfuse_session_id"] = session_id
         config: dict[str, Any] = {
             "callbacks": [_lf_handler] if _lf_handler is not None else [],
-            "metadata": metadata,
+            "metadata": _trace_metadata(req),
         }
         try:
             final = graph.invoke(state, config=config)

@@ -20,6 +20,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -55,13 +56,26 @@ class AgentState:
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
+@lru_cache(maxsize=1)
 def llm() -> ChatOpenAI:
-    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
+    """Shared chat client pointed at VLLM_BASE_URL (your local vLLM by default).
+
+    Phase 6 / iteration 1: this is cached (one instance for the whole process)
+    instead of constructed per node call. A new ChatOpenAI builds a fresh httpx
+    connection pool each time, so the old code opened/tore down sockets on every
+    one of the 2-6 LLM calls per request - under load that exhausts ephemeral
+    ports and surfaces as connection-reset 'client errors'. Reusing one pooled
+    client fixes that and cuts per-call connect latency. The bounded timeout +
+    retries stop a call stuck in vLLM's queue from hanging until the caller's
+    120s timeout (which showed up as load-test 'timeouts').
+    """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        timeout=60.0,
+        max_retries=2,
     )
 
 

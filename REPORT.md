@@ -111,7 +111,58 @@ So the architecture earns its keep — iter 3 accuracy is genuinely higher than 
 > **Outstanding deliverable:** `screenshots/grafana_eval_run.png` (Grafana dashboard captured *while* the baseline eval runs) is not yet in `screenshots/` — re-run the eval with Grafana open and capture it. The ~60-request burst (30 questions × ~2 vLLM calls, with 12 questions making a 3rd) is the load to watch.
 
 ## Phase 6 — Performance tuning
-_TODO: iteration log — "saw X → hypothesized Y → changed Z → result was W" + Grafana screenshots._
+
+**SLO under test:** P95 end-to-end agent latency < 5 s at 10 RPS over a 5-minute window.
+
+This phase is an iteration log: each round is *saw X → hypothesized Y → changed Z → measured W*, one or two small changes at a time so the metric movement is attributable.
+
+### Iteration 0 — baseline (the first run was rough)
+
+Drove the agent at the target 10 RPS for 5 minutes (`load_test/driver.py --rps 10 --duration 300`). It did not go well:
+
+| metric | value |
+|--------|-------|
+| requested / achieved RPS | 10.0 / **8.33** |
+| total requests | 3000 |
+| **ok** | **1585 (52.8%)** |
+| timeouts | 510 |
+| http errors | 359 |
+| client errors | 546 |
+| latency P50 / P95 / P99 | **85.6 s / 115.1 s / 119.6 s** |
+| latency max | 120.6 s (= driver client timeout) |
+
+So ~47% of requests failed and even the *successful* ones took a P50 of 86 s against a 5 s SLO — the system was in deep overload, not marginally over budget. The driver couldn't even sustain 10 RPS (achieved 8.33) because in-flight work piled up faster than it drained.
+
+**Diagnosis.** Two findings, one of them an observability gap I had to close first:
+
+1. **The errors were invisible.** Prometheus only scraped vLLM (`:8000`), and vLLM reported zero errors (all completions `finished_reason="stop"`). Every failure happened at the agent/client layer, which nothing scraped — and the agent's *end-to-end* latency (the actual SLO) wasn't on any dashboard. Fixed by instrumenting the agent with a `/metrics` endpoint (`agent_request_latency_seconds`, `agent_requests_total{outcome}`, `agent_inflight_requests`), adding an `agent` scrape job, and an "Errors & SLO (agent)" dashboard row. vLLM being clean while the agent drowns confirms **the orchestration layer is the bottleneck, not a single inference call.**
+2. **The agent churns HTTP clients.** `agent/graph.py:llm()` constructed a brand-new `ChatOpenAI` (and a fresh httpx connection pool) on *every* node call — 2–6 calls per request. Under concurrency this opens and tears down sockets constantly, exhausting ephemeral ports → connection-reset **client errors** (546 of them) and added connect latency on top of an already-saturated system. Calls also had no timeout, so one stuck in vLLM's queue hung until the driver's 120 s cap → **timeouts**.
+
+### Suggested improvements (prioritized)
+
+1. **(this iteration) Reuse a single pooled LLM client + bound per-call timeout/retries.** Directly targets client errors and timeouts; one-function change.
+2. **Cap agent concurrency / shed load early.** Raise (or deliberately bound) Starlette's sync threadpool and add an admission limit so overflow gets a fast `503` instead of a 120 s hang — converts silent timeouts into honest, cheap rejections and protects the requests that *are* admitted.
+3. **Cut work per request.** Most cost is the 2–3 serial vLLM calls; lowering `MAX_ITERATIONS` or skipping `verify` when the first execution already returns plausible rows reduces vLLM load (trade against the Phase 5 accuracy read).
+4. **Tune vLLM for throughput.** The Phase 1 levers — drop `--max-model-len` to ~4096, raise effective batching, evaluate FP8 weights + KV cache — once the agent stops being the limiter.
+5. **(bigger, deferred) Make the agent async** so requests aren't serialized on a bounded threadpool. Explicitly out of scope for these incremental iterations.
+
+### Iteration 1 — pooled LLM client + bounded timeout/retries
+
+- **Saw:** 546 client errors + 510 timeouts; latency dominated by overload, not by a single slow inference.
+- **Hypothesized:** per-call `ChatOpenAI` construction churns connections (→ client errors) and unbounded calls hang (→ timeouts). Pooling connections and bounding calls should cut both with no behavioral change.
+- **Changed:** `agent/graph.py:llm()` is now an `@lru_cache(maxsize=1)` singleton (one reused httpx pool for the whole process) with `timeout=60.0` and `max_retries=2`. No graph/prompt changes.
+- **Result:** _re-run `--rps 10 --duration 300` after restarting the agent and record below._
+
+| metric | iter 0 (baseline) | iter 1 (pooled client) |
+|--------|-------------------|------------------------|
+| ok | 1585 | _TBD_ |
+| timeouts | 510 | _TBD_ |
+| http errors | 359 | _TBD_ |
+| client errors | 546 | _TBD_ |
+| achieved RPS | 8.33 | _TBD_ |
+| latency P50 / P95 / P99 | 85.6 / 115.1 / 119.6 s | _TBD_ |
+
+> Capture the agent "Errors & SLO" row during the run (`screenshots/grafana_load_iter1.png`) and compare `client errors` and `agent_inflight_requests` against the baseline. Expect the biggest drop in client errors; if timeouts persist, the bottleneck is concurrency (→ improvement #2) rather than connection churn.
 
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._

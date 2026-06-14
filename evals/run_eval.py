@@ -56,7 +56,7 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 # ---------- Implement these (Phase 5) ----------------------------------
 
-def eval_one(question: dict, agent_url: str) -> dict:
+def eval_one(question: dict, agent_url: str, run_label: str = "eval_baseline") -> dict:
     """Score one question, capturing per-iteration correctness.
 
     Calls the agent over HTTP, then reconstructs the SQL it held after each
@@ -68,7 +68,7 @@ def eval_one(question: dict, agent_url: str) -> dict:
     q_text = question["question"]
 
     # --- call the agent over HTTP ---
-    payload = {"question": q_text, "db": db_id, "tags": {"phase": "eval_baseline", "db": db_id}}
+    payload = {"question": q_text, "db": db_id, "tags": {"phase": "eval", "run": run_label, "db": db_id}}
     t0 = time.monotonic()
     try:
         resp = httpx.post(agent_url, json=payload, timeout=180.0)
@@ -183,6 +183,11 @@ def main() -> None:
     parser.add_argument("--eval-set", type=Path, default=DEFAULT_EVAL_FILE)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT_FILE)
     parser.add_argument("--agent-url", default=AGENT_URL_DEFAULT)
+    parser.add_argument(
+        "--run-label",
+        default="eval_baseline",
+        help="Langfuse run/session tag, e.g. eval_baseline, eval_after_tuning",
+    )
     args = parser.parse_args()
 
     questions = [json.loads(line) for line in args.eval_set.read_text().splitlines() if line.strip()]
@@ -192,7 +197,7 @@ def main() -> None:
     t0 = time.monotonic()
     for i, q in enumerate(questions, 1):
         print(f"[{i}/{len(questions)}] {q['db_id']}: {q['question'][:60]}...", flush=True)
-        results.append(eval_one(q, args.agent_url))
+        results.append(eval_one(q, args.agent_url, args.run_label))
     elapsed = time.monotonic() - t0
 
     summary = summarize(results)
