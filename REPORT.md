@@ -81,7 +81,34 @@ The loop **engages** (2 revisions, both hitting the 3-step cap) but on this smal
 ---
 
 ## Phase 5 — Evaluation
-_TODO: baseline execution-accuracy on the eval set._
+
+**Method.** [`evals/run_eval.py`](evals/run_eval.py) reads the 30 curated questions in `evals/eval_set.jsonl`, calls the agent over HTTP (`POST /answer`), and scores by **execution accuracy**: the agent's final SQL and the gold SQL are both run against the target BIRD sqlite DB and their result sets compared after canonicalization (rows sorted, cells stringified, `NULL`→`''`). This is robust to the many syntactically-different-but-equivalent ways to write the same query. To get the per-iteration signal, `eval_one` reconstructs the SQL the agent held after each `generate_sql`/`revise` step from the returned `history` and executes each one; `summarize` then carries the last value forward for questions that terminated early, so "pass rate at iteration k" answers *"what would accuracy be if we always stopped after step k?"*. The gold query is executed once per question and reused. Run end-to-end with:
+
+```bash
+uv run python evals/run_eval.py --out results/eval_baseline.json
+```
+
+**Baseline result** (`results/eval_baseline.json`, 30 questions, ~40.7 s wall-clock, 0 agent failures, avg 1.28 s/question):
+
+| metric | value |
+|--------|-------|
+| overall execution accuracy | **0.333 (10/30)** |
+| pass rate @ iter 0 | 0.300 (9/30) |
+| pass rate @ iter 1 | 0.333 (10/30) |
+| pass rate @ iter 2 | 0.333 (10/30) |
+| iteration distribution | 1 step ×18, 2 steps ×5, 3 steps ×7 |
+| questions revised (>1 step) | 12 |
+| agent failures | 0 |
+
+**Is the loop doing real work?** Marginally, but it is net-positive. The verify→revise loop **engages on 12 of 30 questions**, yet the pass rate moves only from **0.300 (iter 0) → 0.333 (iter 1)** and then flattens. Reconstructing each question's trajectory:
+
+- **+1 gained** (wrong→right): the loop fixed exactly one question — *"Mention the reputation of users who had obtained the badge…"* (`codebase_community`).
+- **0 lost** (right→wrong): no revision ever corrupted an already-correct answer — verify is at least not actively harmful.
+- The other **11 of 12 revisions failed to flip** the answer to correct (most hit the 3-step cap still wrong).
+
+So the architecture earns its keep — iter 3 accuracy is genuinely higher than iter 0, not flat — but the effect is small (+1 question, +3.3 pp) and almost entirely capped by **revision quality, not loop wiring**. The loop fires on the right questions but the revise prompt rarely repairs them. Inspecting the misses, the dominant failure modes are semantic rather than syntactic: wrong column choice (e.g. `A14` vs `A15` for the crime-count question), case-sensitive value mismatches (`'m'` vs `'M'` for gender), and over-complex date/string arithmetic — exactly the cases a sharper verify/revise prompt could catch. **Tightening the verify/revise prompts so revisions actually correct these is the primary Phase 6 lever.**
+
+> **Outstanding deliverable:** `screenshots/grafana_eval_run.png` (Grafana dashboard captured *while* the baseline eval runs) is not yet in `screenshots/` — re-run the eval with Grafana open and capture it. The ~60-request burst (30 questions × ~2 vLLM calls, with 12 questions making a 3rd) is the load to watch.
 
 ## Phase 6 — Performance tuning
 _TODO: iteration log — "saw X → hypothesized Y → changed Z → result was W" + Grafana screenshots._
