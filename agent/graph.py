@@ -10,6 +10,12 @@ Graph shape:
 
 Loop is capped at MAX_ITERATIONS total generate/revise calls.
 
+Phase 6 / iteration 5: the iter-4 verify-skip (end as soon as a query returned
+rows) was reverted - it gave a large latency win but the eval flagged an
+accuracy regression, and the verifier's check on non-empty-but-wrong results is
+worth keeping. Decode latency is instead reduced on the serving side (FP8 KV
+cache, bounded output) rather than by dropping the safety check.
+
 The execute node and the graph wiring are provided. `generate_sql_node` is
 filled in as a worked example; you implement `verify`, `revise`, and the
 conditional router following the same shape.
@@ -32,8 +38,12 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
-MAX_ITERATIONS = 3
+# Phase 6 / iteration 4: lowered 3 -> 2 (1 generate + at most 1 revise). The
+# Phase 5 read showed the pass rate is flat across iterations (iter_0 == iter_2)
+# - the second revise was not recovering accuracy, only spending a 3rd serial
+# vLLM call per request that needed it. Cutting it removes tail work from the
+# decode-bound bottleneck at ~no accuracy cost (re-confirm via run_eval.py).
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -74,6 +84,11 @@ def llm() -> ChatOpenAI:
     per call (5s end-to-end / ~3 calls), and a healthy call takes <1.3s (Phase 5),
     so any call past 10s is already an SLO miss and a slot-holder under load -
     failing it fast frees the worker instead of letting it block for a minute.
+
+    Phase 6 / iteration 5: max_tokens=512 bounds the decode budget per call. The
+    outputs are short (a single SELECT, or a one-line JSON verdict); 512 is ample
+    headroom for a complex query yet caps a pathological runaway generation that
+    would otherwise hold decode slots in the (decode-bound) batch indefinitely.
     """
     return ChatOpenAI(
         model=VLLM_MODEL,
@@ -82,6 +97,7 @@ def llm() -> ChatOpenAI:
         temperature=0.0,
         timeout=10.0,
         max_retries=2,
+        max_tokens=512,
     )
 
 

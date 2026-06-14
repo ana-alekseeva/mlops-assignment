@@ -249,5 +249,42 @@ Three things the data settles:
 
 **Caveat.** The only model-visible change this iteration is result-cell truncation (`…(+N chars)` on blobs >200 chars); schema and prompt templates are byte-identical to iter 2, so accuracy risk is minimal — a confirming `uv run python evals/run_eval.py` is still worthwhile before adopting.
 
+### Iteration 4 — cut the work per request (fewer serial vLLM calls)
+
+Iteration 3 settled the diagnosis: prefix cache is ~90% hit, prompts are small, and latency is a *flat steady state* at ~170 requests batched in vLLM — so the wall is **decode throughput at that concurrency**, not input size. The only way to move it is to make each request occupy fewer/cheaper decode slots. Two changes, on the two layers that control that: the agent (calls per request) and vLLM (KV headroom for the batch).
+
+**Saw.**
+- Every request made **≥2 serial vLLM calls** (generate + verify) before it could finish, and up to 4 (generate + verify + revise + verify). At ~170 in-flight that's ~340–680 concurrent decode streams for 3000 requests — the decode batch the GPU is grinding through.
+- The verifier earns its call only when the result is *suspicious*. Phase 5 (`evals/run_eval.py`): pass rate is **flat across iterations** (iter_0 == iter_2) and the 1-step happy path was ~60% of questions — so on the majority path the verify (and the 2nd revise) spent decode slots without changing the answer.
+- Context was provisioned at `--max-model-len 32768`, but the **largest real prompt is 7,308 tokens** (measured with the Qwen tokenizer: biggest schema + widest result preview in a revise call). The other ~25k of reserved context is KV the batch could be using instead.
+
+**Hypothesized.** Removing the calls that don't change the answer shrinks the decode batch, and giving vLLM 4× the KV headroom lets the remaining batch run deeper without preemption — both should pull P95 down with little/no accuracy cost (the skipped work wasn't lifting the pass rate).
+
+**Changed** (agent + serving; no prompt-template edits):
+- **(skip verify on the happy path)** [`agent/graph.py`](agent/graph.py): new `route_after_execute` gates the LLM verifier behind a cheap deterministic check — a successful query that returned rows ends immediately (**1 vLLM call**); only an empty or errored result is handed to `verify`, which can still trigger `revise`. Halves the call count on the ~60% happy path.
+- **(lower the iteration cap)** `MAX_ITERATIONS` 3 → 2 (1 generate + at most 1 revise). Justified by the flat Phase-5 pass rate — the 2nd revise spent a 3rd serial call without recovering accuracy.
+- **(KV headroom)** [`scripts/start_vllm.sh`](scripts/start_vllm.sh): `--max-model-len 32768 → 8192` (covers the measured 7,308-token worst case + short output, 4× smaller reservation → more sequences resident) and `--max-num-seqs 256` set explicitly (≥ the ~170 observed concurrency; the next knob to sweep). **Not 4096** — that would truncate the 7.3k revise prompt.
+
+**Expected effect on the call budget** (the mechanism P95 should follow):
+
+| path | share (Phase 5) | vLLM calls before | vLLM calls after |
+|------|-----------------|-------------------|------------------|
+| rows on first try (happy) | ~60% | 2 (generate+verify) | **1** (generate) |
+| empty/error → 1 revise | ~25% | 3–4 | 3 (gen+verify+revise; capped) |
+| still failing → 2nd revise | ~15% | 5–6 | **eliminated** (cap=2) |
+
+Load-weighted that's roughly **2.4 → ~1.5 calls/request (~−40%)**, which should translate fairly directly into a shallower decode batch and lower P95.
+
+**Result — pending the next load run** (`uv run python load_test/driver.py --rps 10 --duration 300`) and a Phase 5 re-run. Predicted:
+
+| metric | iter 3 | iter 4 — predicted | confirms if |
+|--------|--------|--------------------|-------------|
+| vLLM calls / request (load-wt) | ~2.4 | **~1.5** | the verify-skip + cap fire as modeled |
+| P95 latency | 62.4 s | → materially lower (target: toward 5 s) | decode batch was the wall |
+| `vllm:num_requests_running` | deep, stable | shallower at the same offered RPS | fewer concurrent decode streams |
+| Phase 5 execution accuracy | baseline | **unchanged (±1 question)** | skipped work wasn't lifting accuracy |
+
+**Caveat — this iteration trades a safety check for throughput, so the eval gate is mandatory, not optional.** Skipping verify means a non-empty-but-wrong result (right rows, wrong columns) is no longer LLM-checked, and `MAX_ITERATIONS=2` drops the 2nd revise. Both are justified by the flat Phase-5 pass rate, but that was a 30-question sample — **re-run `uv run python evals/run_eval.py` and confirm execution accuracy holds before adopting.** If accuracy drops, the cheapest partial rollback is to keep the verify-skip (the big win) but restore `MAX_ITERATIONS=3`. If P95 still misses after this, the bottleneck is raw decode throughput and the remaining levers are vLLM-side: FP8 KV-cache and a `--max-num-seqs` sweep.
+
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._
