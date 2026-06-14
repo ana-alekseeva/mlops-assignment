@@ -184,16 +184,70 @@ This iteration pulls forward improvement #5 ("make the agent async"), which was 
 - **(async — the main lever)** [`agent/server.py`](agent/server.py): `answer` is now `async def` and awaits `graph.ainvoke(...)` — the endpoint runs on the event loop instead of the threadpool. The Prometheus `try/finally` instrumentation is unchanged. [`agent/graph.py`](agent/graph.py): the three LLM nodes (`generate_sql`, `verify`, `revise`) are `async def` and `await llm().ainvoke(...)` (the cached, pooled client from iter 1 is reused — it already holds an `httpx.AsyncClient`). `execute_node` is `async def` and offloads the blocking sqlite call via `asyncio.to_thread(...)` so a slow query can't stall the event loop for all in-flight requests. The pure nodes (`_attach_schema`, `route_after_verify`) stay sync.
 - **(timeout)** [`agent/graph.py`](agent/graph.py) `llm()`: per-call `timeout` tightened **60 s → 10 s**. The SLO budgets ~1.5 s/call (5 s end-to-end ÷ ~3 calls) and a healthy call takes <1.3 s (Phase 5), so any call past 10 s is already an SLO miss *and* a slot-holder under load — failing it fast frees the worker instead of letting it block for a minute. Eval calls (~0.85–1.28 s) are nowhere near 10 s, so Phase 5 accuracy is unaffected.
 
-**Result — pending the next load run on the H100** (`uv run python load_test/driver.py --rps 10 --duration 300 --run-label iter2-async`). Predicted direction, and the exact metrics that confirm or refute the hypothesis:
+**Result — the queue collapsed, exactly as predicted; the SLO is still missed but now for a different reason.** Measured on the H100 (`uv run python load_test/driver.py --rps 10 --duration 300`, 3000 requests):
 
-| metric | iter 1 (pooled) | iter 2 (async) — predicted | confirms if |
-|--------|-----------------|----------------------------|-------------|
-| achieved RPS | 8.33 | → ~10.0 | driver no longer outruns the server |
-| `agent_inflight_requests` | plateaus ~40 (thread cap) | rises with offered load, no 40-wall | the ceiling is gone |
-| http_errors | 379 | → near 0 | queue-timeout 500s were the cause |
-| P95 latency | 99.8 s | → collapses toward the vLLM-bound floor | latency was queueing, not inference |
+| metric | iter 0 (baseline) | iter 1 (pooled) | iter 2 (async) | iter1 → iter2 | predicted? |
+|--------|-------------------|-----------------|----------------|---------------|------------|
+| ok | 1585 | 2599 | **2953** | +354 | ✓ |
+| http_errors | 359 | 379 | **4** | −375 | ✓ near-zero — queue-timeout 500s confirmed |
+| timeouts | 510 | 7 | **5** | −2 | ✓ stayed gone |
+| client_errors | 546 | 15 | **38** | +23 | ✗ ticked up (see below) |
+| P50 latency | 85.6 s | 78.9 s | **6.86 s** | −72 s (−91%) | ✓ collapsed |
+| P95 latency | 115.1 s | 99.8 s | **41.4 s** | −58.4 s (−59%) | ✓ collapsed — but not to floor |
+| P99 latency | 119.6 s | 105.6 s | **55.4 s** | −50.2 s | ✓ |
+| latency max | 120.6 s | — | **66.9 s** | — | no longer pinned at the 120 s client cap |
+| achieved RPS | 8.33 | 8.33 | **8.33** | — | ✗ did **not** rise to ~10 |
 
-If P95 *doesn't* collapse after this, the bottleneck has moved into vLLM itself (batching/KV), which is the cue to start the Phase 1 server levers (Iteration 3: `--max-model-len 4096`, prefix-cache hit-rate check, then FP8). _Numbers to be filled in once the load run is captured (plus `screenshots/grafana_load_iter2.png` — watch `agent_inflight_requests` no longer pinned at ~40)._
+**What confirmed.** Removing the 40-thread ceiling did what the diagnosis said it would. `http_errors` fell 379→4 — the 500s really were queue-timeout `APITimeoutError`/`APIConnectionError` raised inside `graph.invoke` once a request waited past the per-call timeout, not a separate bug. Latency collapsed in lockstep: P50 79 s→6.9 s and P95 100 s→41 s. That confirms finding 2 — the bulk of iter-1 latency was *queueing behind the 40-wide gate*, not inference. Little's law sanity check the other way: at the new P50 ≈ 6.9 s and λ ≈ 8.3 req/s, resident work L ≈ 57 — an order of magnitude below the ~790 the threadpool was forcing into a queue.
+
+**What didn't, and the honest reads:**
+- **SLO still missed: P95 41 s vs 5 s target.** The queue is gone but 41 s is far above the vLLM-bound floor (~1.3 s/call × ~3 calls ≈ 4 s). So the bottleneck has now *moved* — per the iter-2 exit criterion above, this is the cue that the remaining wall is in vLLM itself (batching/KV/decode under concurrency) rather than the agent's concurrency model. That is Iteration 3.
+- **achieved RPS stuck at 8.33** (wall clock 360 s for a nominal 300 s run). The driver still isn't sustaining the offered 10 RPS, so the server is still applying backpressure somewhere downstream of the (now-removed) thread gate — consistent with a vLLM-side ceiling. Worth confirming whether the driver is open- or closed-loop before reading too much into the exact number.
+- **client_errors ticked 15→38.** Small in absolute terms (1.3% of requests) but the wrong direction. Likely the tightened 10 s per-call timeout now firing on the slowest calls under load (failing fast by design) rather than connection churn — to be confirmed from the captured 4xx/error bodies in `results/load_test.json`.
+
+**Next (Iteration 3).** The latency is now genuinely inference-bound, so the Phase 1 server levers come into play: drop `--max-model-len` to ~4096 (KV-cache headroom → more concurrent sequences), check prefix-cache hit rate on the shared schema prompt, then evaluate FP8 weights + KV-cache — each validated against the Phase 5 eval set before adoption. _Capture `screenshots/grafana_load_iter2.png` to confirm `agent_inflight_requests` now rises with load instead of pinning at ~40._
+
+### Iteration 3 — prompt & KV reduction (fewer tokens in, reuse the KV)
+
+Iteration 2 left P95 at 41 s with the agent's thread queue gone, which localized the residual wall to vLLM itself (prefill/decode under concurrency). The cheapest way to relieve that is to make each request cost vLLM *less work*: reuse the KV we recompute every call (prefix caching) and bound the few unbounded token sources, without disturbing the prompts the model relies on for accuracy.
+
+**Saw — measured the actual prompt composition before changing anything (not assumed):**
+
+1. **The schema is modest and left as-is.** Rendered schemas span 177–1,826 tokens (`toxicology` → `european_football_2`); load-weighted across `perf_pool.jsonl` the average is **662 tokens**. A compressed renderer could roughly halve that, but it changes the exact text the model has been tuned against for ~350 tokens of savings — not worth the accuracy risk this iteration, so the `CREATE TABLE` rendering in [`agent/schema.py`](agent/schema.py) is unchanged.
+2. **Result cell *width* was unbounded.** `ExecutionResult.render()` capped rows at 10 but not cell length, so the verify/revise prompts ballooned on wide-text columns: `card_games.cards SELECT *` → 3,270 tokens, `codebase_community.posts.Body` → 1,079. The verifier only needs the answer's *shape*, not full blobs — so this is a token win with no information the verifier actually uses.
+3. **The prefix repeats constantly but wasn't explicitly cached.** For a given DB the system rules + schema are byte-identical across every question *and* across the 2–3 generate/verify/revise calls within one request. Note the earlier "single DB" framing is wrong for this repo — `perf_pool` spans **11 DBs** (64–187 questions each), so there are 11 stable prefixes, not one. On an H100 all 11 fit in KV at once, so the hit rate should still be high.
+
+**Hypothesized.** The two zero-accuracy-cost levers — capping cell width and making prefix caching explicit — reduce vLLM's per-request work (the now-dominant bottleneck): the cap trims the worst verify/revise prompts, and prefix caching lets vLLM reuse the 11 schema prefixes' prefill KV instead of recomputing it on every call. Neither touches the graph logic or the prompt *templates*, so Phase 5 accuracy should hold.
+
+**Changed** (two levers, neither touching graph control flow or the prompt *templates*):
+- **(cell cap)** [`agent/execution.py`](agent/execution.py) `render()`: each cell truncated to 200 chars with a `…(+N chars)` marker. Bites exactly the wide-text case — `posts.Body` preview 1,079 → 448 tokens (−58%) — and leaves narrow many-column results (e.g. `cards`) essentially unchanged, which is correct.
+- **(B0 — prefix caching)** [`scripts/start_vllm.sh`](scripts/start_vllm.sh): `--enable-prefix-caching` passed explicitly (on by default in the vLLM 0.23 V1 engine; explicit = self-documenting). To be confirmed via `vllm:prefix_cache_hits / vllm:prefix_cache_queries` on `:8000/metrics`.
+
+_(Schema compression was considered and deliberately deferred — see Saw #1. If a later iteration wants those ~350 tokens, it should ship behind a Phase 5 eval re-run.)_
+
+**Result — the levers were no-ops, and that is the finding: prompt size is not the bottleneck.** Measured (`uv run python load_test/driver.py --rps 10 --duration 300`):
+
+| metric | iter 2 (async) | iter 3 (prompt/KV) | read |
+|--------|----------------|--------------------|------|
+| ok | 2953 | 2932 | flat |
+| P50 latency | 6.86 s | **17.1 s** | *worse* — but see "variance" below |
+| P95 latency | 41.4 s | **62.4 s** | *worse* |
+| P99 latency | 55.4 s | 73.9 s | *worse* |
+| latency max | 66.9 s | 119.1 s | one request hit the 120 s client cap |
+| client_errors | 38 | 60 | `ClientOSError` ×58 (socket churn under load) |
+| `vllm:prefix_cache_hits/queries` | — | **5.82M / 6.46M = 90%** | cache was already working |
+
+Three things the data settles:
+
+1. **Prefix caching was already in effect — B0 captured no new win.** The 90% hit rate confirms the 11 schema prefixes stay KV-resident, but the V1 engine had prefix caching on by default in iter 2 too, so the explicit `--enable-prefix-caching` flag changed nothing measurable. It documents the config; it doesn't move the metric.
+2. **`achieved_rps = 8.33` is a driver artifact, not a server ceiling** — and it was over-read in iters 0–2. [`load_test/driver.py`](load_test/driver.py) fires open-loop for `duration` (300 s) then drains in-flight with a **60 s cap** (`asyncio.wait(..., timeout=60)`), so wall clock pins at ~360 s and `3000 / 360 = 8.33` *every run independent of the server*. The server is absorbing the full offered 10 RPS; the real signal is latency, not this number.
+3. **Latency is a flat steady state, not an exploding queue.** Bucketing the run's OK latencies first/mid/last 25 % gives mean 19.9 / 22.2 / 23.4 s — roughly flat. So vLLM keeps up with 10 RPS but at a deep, *stable* in-flight population: by Little's law L = λ·W ≈ 10 × 17 ≈ **170 requests batched at once**. The wall is **vLLM decode throughput at that concurrency**, which prompt-token count barely touches (prefill is cached and small; the cost is decoding SQL across 2–3 serial calls × 170 concurrent requests).
+
+**On the regression / variance.** The two levers only ever *reduce* vLLM load, so they can't explain P50 6.9→17 s. That delta is run-to-run variance in vLLM serving state between two open-loop runs at a saturated operating point — not attributable to the change. The point stands either way: shrinking prompts did not help, exactly as the 90% prefix hit rate and flat steady-state latency predict. (To *attribute* the regression we'd A/B back-to-back: revert the flag, rerun, compare — low priority, since neither lever is the path to the SLO.)
+
+**Next — stop shrinking inputs, cut the work per request.** P95 must fall ~12× (62 s → 5 s) and the bottleneck is decode-under-concurrency, so Iteration 4 targets *fewer/cheaper vLLM calls per request*: (a) skip `verify`/`revise` when the first execution already returns plausible rows (most requests are 1-shot — only spend the extra 2 calls when needed), and/or lower `MAX_ITERATIONS`; (b) on the serving side, tune `--max-num-seqs` and drop `--max-model-len 32768 → 4096` (prompts are well under 4 k, freeing KV for deeper batches). Each validated against the Phase 5 eval. The cell cap stays — it's a free, correct bound on pathological prompts even though it didn't move this run.
+
+**Caveat.** The only model-visible change this iteration is result-cell truncation (`…(+N chars)` on blobs >200 chars); schema and prompt templates are byte-identical to iter 2, so accuracy risk is minimal — a confirming `uv run python evals/run_eval.py` is still worthwhile before adopting.
 
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._

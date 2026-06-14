@@ -23,8 +23,17 @@ MODEL="${VLLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
 
 # --max-model-len caps context (native max 262144) to keep KV-cache memory in
 # check. Phase 1 grades these flags - tune them for this workload.
+#
+# --enable-prefix-caching (Phase 6 / iteration 3): the constant prefix of every
+# prompt (system rules + the DB schema) is identical across all questions for a
+# given DB AND across the 2-3 generate/verify/revise calls within one request.
+# Prefix caching computes that prefill KV once and reuses it on every hit. The
+# V1 engine in vLLM 0.23 has this on by default; we pass it explicitly so the
+# config is self-documenting. Confirm the hit rate via the
+# vllm:prefix_cache_hits / vllm:prefix_cache_queries metrics on :8000/metrics.
 exec uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
     --port 8000 \
-    --max-model-len 32768
+    --max-model-len 32768 \
+    --enable-prefix-caching
