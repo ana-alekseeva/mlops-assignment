@@ -47,6 +47,39 @@ Initial baseline is serving and returning correct SQL. Per Phase 1 step 3, these
 
 ---
 
+## Phase 3 — Agent
+
+**Architecture.** A LangGraph text-to-SQL agent ([`agent/graph.py`](agent/graph.py)) with a self-consistency-style verify/revise loop:
+
+```
+attach_schema -> generate_sql -> execute -> verify --ok--> END
+                                    ^                  |
+                                    |                not-ok
+                                    +------ revise <----+
+```
+
+- `generate_sql` / `verify` / `revise` are vLLM calls; `execute` runs the SQL read-only against the target sqlite DB.
+- `verify` returns a `{"ok", "issue"}` verdict, parsed defensively; a failed execution can never be judged `ok`, so a broken query always routes to revise.
+- The **verify→revise loop is capped at `MAX_ITERATIONS = 3`** (1 generate + up to 2 revises) so it always terminates.
+
+**Serving.** The agent is a FastAPI app ([`agent/server.py`](agent/server.py)) run as a host process — **listening on port 8001** (`POST /answer`, `GET /health`) — not a container, so it can reach vLLM on `localhost:8000` and read the local BIRD sqlite files directly. Langfuse tracing is attached when keys are present.
+
+**Interactive test (5 questions).** The loop fires and terminates correctly: **2 of 5 questions were revised**; the other 3 passed `verify` on the first attempt, and there were no agent failures.
+
+| metric | value |
+|--------|-------|
+| questions | 5 |
+| overall pass rate | 0.4 (2/5) |
+| pass rate by iteration | iter_0 = 0.4, iter_1 = 0.4, iter_2 = 0.4 |
+| iteration distribution | 1 step ×3, 3 steps ×2 |
+| questions revised | 2 |
+| agent failures | 0 |
+| avg latency | 0.85 s |
+
+The loop **engages** (2 revisions, both hitting the 3-step cap) but on this small sample does not yet raise accuracy — the pass rate is flat across iterations (iter_0 == iter_2). Calibrating the verify/revise prompts so revisions actually correct wrong answers is tracked in Phase 6.
+
+---
+
 ## Phase 5 — Evaluation
 _TODO: baseline execution-accuracy on the eval set._
 

@@ -9,6 +9,7 @@ agent's final SQL, the result rows, and per-iteration history.
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
@@ -19,17 +20,30 @@ load_dotenv()
 
 from agent.graph import AgentState, graph  # noqa: E402
 
-# Langfuse callback handler. If keys are set we initialize it; failures
-# are NOT swallowed - a misconfigured Langfuse should not silently
-# produce zero traces.
+# Langfuse tracing. With keys set we initialize the LangChain callback handler
+# (langfuse 4.x imports it from langfuse.langchain) and keep a client handle so
+# we can flush buffered traces on shutdown. Failures are NOT swallowed - a
+# misconfigured Langfuse should not silently produce zero traces.
 _lf_handler: Any = None
+_lf_client: Any = None
 if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+    from langfuse import get_client
     from langfuse.langchain import CallbackHandler
 
     _lf_handler = CallbackHandler()
+    _lf_client = get_client()
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Best practice: flush on shutdown so the tail of a run (e.g. the last eval
+    # questions) is delivered instead of dying in the buffer with the process.
+    yield
+    if _lf_client is not None:
+        _lf_client.flush()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class AnswerRequest(BaseModel):
@@ -55,9 +69,21 @@ def health() -> dict[str, str]:
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
+    # Best-practice trace shaping via Langfuse's reserved metadata keys: a stable
+    # trace name, tags for filtering, the db under test, and a session id (the
+    # caller's "phase" tag by default) so a whole eval/load run groups together.
+    metadata: dict[str, Any] = {
+        **req.tags,
+        "langfuse_trace_name": "sql-agent",
+        "langfuse_tags": ["sql-agent", "text-to-sql"],
+        "db_id": req.db,
+    }
+    session_id = req.tags.get("session_id") or req.tags.get("phase")
+    if session_id:
+        metadata["langfuse_session_id"] = session_id
     config: dict[str, Any] = {
         "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": req.tags,
+        "metadata": metadata,
     }
     try:
         final = graph.invoke(state, config=config)
