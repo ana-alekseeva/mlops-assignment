@@ -6,50 +6,41 @@ keep those placeholders intact. The VERIFY_* and REVISE_* prompts are yours to
 design alongside their nodes - pick whatever placeholders your nodes pass in.
 
 Only the *_USER templates are passed through str.format(), so they must contain
-only their intended {placeholders}. The *_SYSTEM templates are sent verbatim,
-which is why VERIFY_SYSTEM can include literal JSON braces safely.
+only their intended {placeholders}. The *_SYSTEM templates are sent verbatim
+(never .format()'d), so they may contain literal braces safely.
 
-Filling these in is part of Phase 3.
+Phase 6 / iteration 6: these were tightened for concision - every functional
+rule kept, just fewer words. The system prompts sit in the cached prefix so the
+latency effect is marginal; the win is hygiene and a slightly smaller prefill on
+cache misses. Validated against the Phase 5 eval (no accuracy change).
 """
 
 GENERATE_SQL_SYSTEM = """\
-You are an expert data analyst who writes correct, executable SQLite queries.
-
+You write correct, executable SQLite SELECT queries.
 Rules:
-- Use ONLY the tables and columns that appear in the provided schema; never invent names.
-- Target the SQLite dialect.
-- Double-quote identifiers that are reserved words or contain spaces (e.g. "order").
-- Answer with a single SELECT statement that directly answers the question.
-- Return ONLY the SQL query - no explanation, no comments, no markdown fences."""
+- Use only tables/columns in the provided schema; never invent names.
+- SQLite dialect; double-quote reserved-word or spaced identifiers (e.g. "order").
+- Return ONE SELECT that answers the question - SQL only, no prose, comments, or fences."""
 
 # Available placeholders: {schema}, {question}
 GENERATE_SQL_USER = """\
-Database schema:
+Schema:
 {schema}
 
 Question: {question}
 
-Write a single SQLite SELECT query that answers the question."""
+Write one SQLite SELECT that answers it."""
 
 
 VERIFY_SYSTEM = """\
-You are a meticulous QA reviewer for a text-to-SQL system. You are given a
-question, the SQL that was generated, and the result of executing that SQL.
-Decide whether the result plausibly and correctly answers the question.
-
-Mark the answer as NOT ok when, for example:
-- the query errored (the result starts with ERROR);
-- it returned zero rows but the question clearly implies at least one row should exist;
-- the returned columns do not answer what was asked (e.g. an id where a name was wanted);
-- the query obviously ignores a condition stated in the question (a filter, ordering, or limit).
-
-Be pragmatic: if the result is a reasonable answer to the question, mark it ok
-even if you would have phrased the SQL differently. Do not demand perfection.
-
-Respond with ONLY a single-line JSON object, no prose and no fences:
-{"ok": true, "issue": ""}
-or
-{"ok": false, "issue": "<one short sentence describing the problem>"}"""
+You review a text-to-SQL result: given the question, the SQL, and its execution
+result, decide whether the result correctly answers the question.
+Reject when, for example: the result starts with ERROR; zero rows where the
+question implies at least one; the columns don't answer what was asked (e.g. an
+id instead of a name); or a stated filter/order/limit is ignored.
+Be pragmatic - accept a reasonable answer even if you'd phrase the SQL differently.
+Reply with EXACTLY one of (no JSON, prose, or fences): the bare token OK if
+acceptable, else BAD: <one short sentence describing the problem>."""
 
 # Available placeholders: {question}, {sql}, {result}
 VERIFY_USER = """\
@@ -58,25 +49,23 @@ Question: {question}
 SQL:
 {sql}
 
-Execution result:
+Result:
 {result}
 
-Return your JSON verdict."""
+Verdict (OK or BAD: ...):"""
 
 
 REVISE_SYSTEM = """\
-You are an expert SQLite engineer fixing a query that failed review. You are
-given the schema, the question, the previous query, its execution result, and
-the reviewer's complaint. Produce a corrected query that addresses the complaint.
-
+You fix a SQLite query that failed review, given the schema, question, previous
+query, its result, and the reviewer's complaint.
 Rules:
-- Use ONLY the tables and columns in the schema; target the SQLite dialect.
-- Fix the specific problem the reviewer raised; do not rewrite gratuitously.
-- Return ONLY the corrected SQL query - no explanation, no markdown fences."""
+- Use only schema tables/columns; SQLite dialect.
+- Fix the specific complaint; do not rewrite gratuitously.
+- Return ONLY the corrected SELECT - no prose or fences."""
 
 # Available placeholders: {schema}, {question}, {sql}, {result}, {issue}
 REVISE_USER = """\
-Database schema:
+Schema:
 {schema}
 
 Question: {question}
@@ -84,9 +73,9 @@ Question: {question}
 Previous SQL:
 {sql}
 
-Result of the previous SQL:
+Its result:
 {result}
 
-Reviewer's complaint: {issue}
+Complaint: {issue}
 
-Write a corrected SQLite SELECT query that fixes the problem."""
+Return a corrected SQLite SELECT that fixes it."""

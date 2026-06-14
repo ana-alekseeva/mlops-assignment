@@ -158,13 +158,26 @@ async def execute_node(state: AgentState) -> dict:
 
 
 def _parse_verdict(text: str) -> tuple[bool | None, str]:
-    """Pull {"ok": bool, "issue": str} out of an LLM reply, defensively.
+    """Recover (ok, issue) from the verifier's reply, defensively.
 
-    The model is asked for a bare JSON object, but may wrap it in prose or
-    fences. Grab the first {...} span and parse it. Returns (None, snippet)
-    when no boolean verdict can be recovered, so the caller picks a fallback.
+    Phase 6 / iteration 6: the verdict contract is now the compact "OK" /
+    "BAD: <issue>" form (one token on the common accept path) instead of a JSON
+    object - decode cost scales with output tokens x concurrency, and verify
+    runs on every request, so trimming the happy verdict ~12 -> 1 token removes
+    most of verify's contribution to the decode batch without dropping the check.
+    A JSON fallback is kept so an old-style `{"ok":..,"issue":..}` reply still
+    parses. Returns (None, snippet) when no verdict can be recovered, so the
+    caller picks a fallback.
     """
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    t = text.strip()
+    low = t.lower()
+    if low.startswith("ok"):
+        return True, ""
+    if low.startswith("bad"):
+        # Drop the leading "BAD" and any ":"/"-"/space separator.
+        return False, t[3:].lstrip(" :-\t").strip()
+    # Backward-compatible fallback: a JSON object {"ok": bool, "issue": str}.
+    match = re.search(r"\{.*\}", t, re.DOTALL)
     if match:
         try:
             obj = json.loads(match.group(0))
@@ -173,7 +186,7 @@ def _parse_verdict(text: str) -> tuple[bool | None, str]:
                 return ok, str(obj.get("issue", "")).strip()
         except (json.JSONDecodeError, AttributeError):
             pass
-    return None, text.strip()[:200]
+    return None, t[:200]
 
 
 async def verify_node(state: AgentState) -> dict:

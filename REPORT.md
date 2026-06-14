@@ -340,13 +340,29 @@ What it confirms:
 
 **Status vs SLO.** P95 47.9 s still misses the 5 s target by ~10×, but the trajectory is set and the next move is identified and measured-into: the verify call is the dominant remaining serial cost, so Iteration 6 starts there, then the `--max-num-seqs` sweep, then (gated) n-gram speculative decoding. See Iteration 6.
 
-### Iteration 6 (planned) — reasoning for the next decode-latency cut
+### Iteration 6 — single-token verify (Lever 1 implemented), then the rest planned
 
-_Written before the run; to be promoted to a measured iteration once iter-5's FP8-KV numbers are in. The ordering is deliberate: cheapest-and-safest first, structural-but-risky last, and the one lever that can backfire (spec decoding) gated on a precondition._
+_Lever 1 is implemented and eval-validated below; Levers 2–3 remain the ordered plan. The ordering is deliberate: cheapest-and-safest first, structural-but-risky last, and the one lever that can backfire (spec decoding) gated on a precondition._
 
 **Where we are.** Decode is throughput-bound: at 10 RPS the system reaches a *stable* deep batch (~170 in-flight, iter-3), and latency is the time a request spends sharing the GPU with that batch. By Little's law the SLO defines the target directly — P95 < 5 s at λ = 10 RPS needs in-flight L = λ·W ≈ **50**, versus ~170 today. So every remaining lever must do one of two things: **raise decode throughput** (so the steady-state batch for a given arrival rate is shallower) or **emit fewer decode tokens** (so each request leaves the batch sooner). Input-side work is already exhausted (prefix cache 90%, prompts bounded, schema small).
 
-**Lever 1 — make `verify` cheap instead of absent (top pick: keeps accuracy, cuts decode).** Iteration 4 showed the verify call is the main extra decode cost, but removing it broke the accuracy gate. The synthesis: *keep the call, shrink its output.* `verify` currently decodes a JSON object (`{"ok": true, "issue": ""}`, ~12 tokens) on every request, the vast majority of which are `ok`. Change the contract so the happy verdict is a **single token** (e.g. `OK`) and the `issue` string is emitted only on rejection. Decode cost scales with output-tokens × concurrency, so cutting the common verdict ~12→1 token removes most of verify's contribution to the batch *without dropping the check* — directly addressing "keep revise, lower decode." Low risk: the verdict parser (`_parse_verdict`) is already defensive and would just learn the bare-token form. Validate on the eval like any prompt change.
+**Lever 1 — make `verify` cheap instead of absent (IMPLEMENTED, eval-validated).** Iteration 4 showed the verify call is the main extra decode cost (~28 s of P95, iter-5 measurement), but removing it broke the accuracy gate. The synthesis: *keep the call, shrink its output.* `verify` used to decode a JSON object (`{"ok": true, "issue": ""}`, ~12 tokens) on every request, the vast majority of which are `ok`. The contract is now the compact form — bare **`OK`** on accept (one token), **`BAD: <issue>`** only on rejection ([`agent/prompts.py`](agent/prompts.py) `VERIFY_SYSTEM`/`VERIFY_USER`); [`agent/graph.py`](agent/graph.py) `_parse_verdict` parses the new form and keeps a JSON fallback for safety. Decode cost scales with output-tokens × concurrency, so cutting the common verdict ~12→1 token removes most of verify's contribution to the batch *without dropping the check*.
+
+**Companion change — prompt concision (hygiene, implemented).** All system/user templates ([`agent/prompts.py`](agent/prompts.py)) were tightened — every functional rule kept (schema-only names, SQLite dialect, quote reserved/spaced identifiers, single SELECT, no fences; the verify reject criteria; revise "fix only the complaint"), just fewer words. System-prompt tokens: generate 90→64, revise 85→65, verify trimmed too. Latency impact is marginal *by design* — the system prompts live in the cached prefix (~90% hit), so this trims prefill only on cache misses; it's hygiene, not a decode lever. Bundled here because it's validated by the same eval.
+
+_Eval gate (warm vLLM, single-token verify + concise prompts):_ overall pass rate **0.40 (12/30) — back to baseline**, `agent_failures` **0**, revise still engaged on **6/30** and lifted iter_0 0.367 → 0.40. Across warm re-runs the score sits at **0.30 – 0.40** (n=30 nondeterminism on the FP8 dev model), centered on baseline with the latest run *at* 0.40 — so single-token verify **and** the concise prompts are **accuracy-neutral**; the one-token verdict did not dumb down the check (revise still fires and recovers questions). Per-question eval latency also edged down (0.63 → ~0.57 s) with the shorter verdict.
+
+_Load test result — helped the tail, less than predicted, and the gap is the lesson._
+
+| metric | iter 5 (JSON verdict) | iter 6 (1-token verdict + concise prompts) |
+|--------|-----------------------|--------------------------------------------|
+| P50 | 10.4 s | 12.4 s (≈ flat; run variance) |
+| P95 | 47.9 s | **39.0 s (−19 %)** |
+| P99 | 58.5 s | **51.0 s (−13 %)** |
+| latency max | 97.5 s | 98.1 s |
+| ok / http_errors / client_errors | 2917 / 0 / 77 | 2949 / 0 / **47** |
+
+P95 fell ~9 s (−19 %) — a real tail win at no accuracy cost — but **not** the collapse toward iter-4's 20 s I predicted. The reason is the important part: **the verify call's cost is dominated by *prefill*, not decode.** Shrinking the verdict trimmed verify's *output* 12 → 1 token, but verify still **prefills the (uncached, up-to-~3k-token) execution result on every request** — that's the bulk of its batch occupancy, and it was untouched. So cutting verdict tokens helps the congested tail (P95/P99, where decode contention bites most) while the median barely moves. This refines the iter-4 takeaway: the ~28 s "verify tax" is mostly the result *prefill*, only partly the verdict *decode*. **Next lever for verify is therefore shrinking the result prefill** (tighter row/column caps in `render()` for the verify path), not its output — a Lever-1b that follows naturally from this measurement. Still ~8× off the 5 s SLO (P95 39 s).
 
 **Lever 2 — `--max-num-seqs` sweep, measurement-driven.** With `max-model-len 8192` and FP8 KV (iter 5) each sequence's KV footprint dropped ~4–8×, so more sequences now fit. A deeper running batch raises decode throughput (amortizes the MoE weight/expert loads over more tokens per step) until HBM bandwidth saturates. Don't guess the value — read `vllm:gpu_cache_usage_perc`, `vllm:num_requests_waiting`, and any preemption counter under load: if KV sits underused while requests wait, raise `--max-num-seqs`; if KV saturates and preemption climbs, that's the ceiling and the lever is exhausted. Cheap, no accuracy risk, pure serving config.
 
@@ -355,6 +371,33 @@ _Written before the run; to be promoted to a measured iteration once iter-5's FP
 **Lever 4 — last resort, accept the floor.** If P95 still misses 5 s with accuracy intact after 1–3, the honest conclusion is that one H100 at 10 RPS with a 2–3-call agent is at its decode floor, and the remaining moves are out-of-scope for serving tuning: shrink the agent to a single call (the iter-4 path, only viable if a future eval shows verify isn't needed), or scale horizontally (more replicas behind the agent). Report the floor rather than chasing it with risky kernels.
 
 **Order of operations:** Lever 1 (cheap verify) → re-measure; Lever 2 (max-num-seqs sweep) → re-measure; only then Lever 3 (n-gram spec, gated). Each behind a Phase 5 eval re-run, one change at a time, so the metric movement stays attributable — same discipline as iters 0–5.
+
+### Iteration 7 — does CPU KV-cache offload help? (hypothesis test)
+
+**Hypothesis under test.** "Spilling KV cache to host RAM (`--swap-space`) raises effective KV capacity, so it should reduce latency under load." Worth testing explicitly because it's a commonly-suggested lever — but the prediction here is **neutral-to-negative**, for a specific reason.
+
+**Why it probably won't help (the reasoning being tested).** Two different things can bind a decode workload:
+- **(a) KV *capacity*** — GPU KV cache fills up, so requests get preempted/recomputed or queued for memory. CPU offload fixes *this*: park a preempted request's KV in host RAM instead of recomputing it.
+- **(b) Decode *throughput*** — the rate the GPU generates tokens across the active batch. Offload does **nothing** for this. KV must reside in HBM to compute attention, so an offloaded sequence has to be streamed **back over PCIe (~tens of GB/s vs HBM's ~3 TB/s)** before it can decode a token — adding latency and swap traffic that *competes* with the decode it's trying to help.
+
+Every iteration so far localizes us to **(b)**: flat steady-state latency (iter 3), vLLM clean of inference errors, throughput pinned at the offered rate, and latency that scales with batch depth. And iteration 5 already *relieved* (a) directly — FP8 KV (≈2× capacity) + `max-model-len 8192` (4× smaller per-sequence reservation). So offload would add capacity we likely don't need and can't convert into decode speed.
+
+**Test design — diagnostic first, A/B only if warranted (don't pay for a run you can predict).**
+1. **Diagnostic (cheap, decisive).** Under the standard load (`--rps 10 --duration 300`), watch on `:8000/metrics`:
+   - `vllm:gpu_cache_usage_perc` — is GPU KV actually near 100%?
+   - `vllm:num_requests_waiting{reason="capacity"}` / any preemption counter — are requests blocked *on memory*?
+   If KV usage stays below ~90 % with no capacity-waiting, **KV is not the binding constraint and offload cannot help** — hypothesis falsified for the price of reading two gauges; stop here.
+2. **A/B (only if the diagnostic shows KV pegged).** Compare iter-6 baseline vs offload-on:
+   ```
+   # baseline already captured (iter 6 load test)
+   ENABLE_KV_OFFLOAD=1 bash scripts/start_vllm.sh      # adds --swap-space 16
+   uv run python load_test/driver.py --rps 10 --duration 300
+   ```
+   **Kill criterion:** if P95/throughput is unchanged or worse, revert — offloaded KV is buying capacity the workload doesn't convert to speed.
+
+**Wiring.** Opt-in and off by default ([`scripts/start_vllm.sh`](scripts/start_vllm.sh)): `ENABLE_KV_OFFLOAD=1` adds `--swap-space ${KV_OFFLOAD_GB:-16}`. Heavier alternatives (LMCache / a KV-transfer connector for true tiered offload) exist but aren't justified unless the diagnostic says capacity is the wall. Kept off the default serving config so it can't silently change the graded setup.
+
+**Result — pending** (vLLM was down at write time; run the diagnostic when it's back up). Expected: KV usage below saturation → offload not pursued, and the finding recorded is *why* (bottleneck is decode throughput, not KV capacity) rather than a latency number. This is the same "shrink decode work / speed up decode" thesis as iters 4–6; offload is orthogonal to it.
 
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._
