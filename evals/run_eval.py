@@ -57,8 +57,71 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 # ---------- Implement these (Phase 5) ----------------------------------
 
 def eval_one(question: dict, agent_url: str) -> dict:
-    """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    """Score one question, capturing per-iteration correctness.
+
+    Calls the agent over HTTP, then reconstructs the SQL it held after each
+    generate/revise step from the returned `history`, executes each against
+    the target DB, and compares the canonicalized rows to the gold query's.
+    """
+    db_id = question["db_id"]
+    gold_sql = question.get("gold_sql", "")
+    q_text = question["question"]
+
+    # --- call the agent over HTTP ---
+    payload = {"question": q_text, "db": db_id, "tags": {"phase": "eval_baseline", "db": db_id}}
+    t0 = time.monotonic()
+    try:
+        resp = httpx.post(agent_url, json=payload, timeout=180.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "db_id": db_id, "question": q_text, "gold_sql": gold_sql,
+            "final_sql": "", "final_correct": False,
+            "iterations": 0, "num_steps": 0, "per_iteration_correct": [],
+            "agent_ok": False, "agent_error": f"{type(e).__name__}: {e}",
+            "gold_error": None, "latency_s": round(time.monotonic() - t0, 3),
+        }
+    latency = round(time.monotonic() - t0, 3)
+
+    history = data.get("history") or []
+    final_sql = data.get("sql") or ""
+
+    # The SQL the agent held after each generate_sql / revise step, in order.
+    # history index k corresponds to the README's "iteration k".
+    step_sqls = [h["sql"] for h in history if h.get("node") in ("generate_sql", "revise") and h.get("sql")]
+    if not step_sqls and final_sql:
+        step_sqls = [final_sql]
+
+    # Gold executed once; reused for every comparison.
+    gold_ok, gold_rows, gold_err = run_sql(db_id, gold_sql)
+
+    def is_correct(sql: str) -> bool:
+        if not sql or not gold_ok:
+            return False
+        ok, rows, _ = run_sql(db_id, sql)
+        return ok and matches(gold_rows, rows)
+
+    per_iteration_correct = [is_correct(sql) for sql in step_sqls]
+    final_correct = (
+        is_correct(final_sql) if final_sql
+        else (per_iteration_correct[-1] if per_iteration_correct else False)
+    )
+
+    return {
+        "db_id": db_id,
+        "question": q_text,
+        "gold_sql": gold_sql,
+        "final_sql": final_sql,
+        "final_correct": final_correct,
+        "iterations": data.get("iterations", len(step_sqls)),
+        "num_steps": len(step_sqls),
+        "per_iteration_correct": per_iteration_correct,
+        "agent_ok": bool(data.get("ok", False)),
+        "agent_error": data.get("error"),
+        "gold_error": gold_err,
+        "latency_s": latency,
+    }
 
 
 def summarize(results: list[dict]) -> dict:
@@ -70,7 +133,47 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    if n == 0:
+        return {
+            "n": 0, "num_correct": 0, "overall_pass_rate": 0.0,
+            "pass_rate_by_iteration": {}, "iteration_distribution": {},
+            "questions_with_revision": 0, "agent_failures": 0, "avg_latency_s": 0.0,
+        }
+
+    num_correct = sum(1 for r in results if r["final_correct"])
+
+    # Horizon = the deepest iteration any question actually reached.
+    horizon = max((r["num_steps"] for r in results), default=1) or 1
+
+    pass_rate_by_iteration: dict[str, float] = {}
+    for k in range(horizon):
+        passed = 0
+        for r in results:
+            pi = r["per_iteration_correct"]
+            if not pi:
+                val = False
+            elif k < len(pi):
+                val = pi[k]
+            else:  # carry-forward: the agent had already terminated
+                val = pi[-1]
+            passed += 1 if val else 0
+        pass_rate_by_iteration[f"iter_{k}"] = round(passed / n, 4)
+
+    dist: dict[int, int] = {}
+    for r in results:
+        dist[r["num_steps"]] = dist.get(r["num_steps"], 0) + 1
+
+    return {
+        "n": n,
+        "num_correct": num_correct,
+        "overall_pass_rate": round(num_correct / n, 4),
+        "pass_rate_by_iteration": pass_rate_by_iteration,
+        "iteration_distribution": {str(k): dist[k] for k in sorted(dist)},
+        "questions_with_revision": sum(1 for r in results if r["num_steps"] > 1),
+        "agent_failures": sum(1 for r in results if r.get("agent_error")),
+        "avg_latency_s": round(sum(r.get("latency_s", 0.0) for r in results) / n, 3),
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
