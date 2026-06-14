@@ -151,18 +151,25 @@ So ~47% of requests failed and even the *successful* ones took a P50 of 86 s aga
 - **Saw:** 546 client errors + 510 timeouts; latency dominated by overload, not by a single slow inference.
 - **Hypothesized:** per-call `ChatOpenAI` construction churns connections (→ client errors) and unbounded calls hang (→ timeouts). Pooling connections and bounding calls should cut both with no behavioral change.
 - **Changed:** `agent/graph.py:llm()` is now an `@lru_cache(maxsize=1)` singleton (one reused httpx pool for the whole process) with `timeout=60.0` and `max_retries=2`. No graph/prompt changes.
-- **Result:** _re-run `--rps 10 --duration 300` after restarting the agent and record below._
+- **Result:** **Big win on the two targeted error classes.** ok jumped 1585→2599 (+64%), timeouts nearly eliminated (510→7), client errors collapsed (546→15), and P95 latency fell 115→100 s. Connection churn *was* the dominant cause of client errors and a large share of timeouts — confirming the hypothesis. The pre-existing **http_errors (500s) did not move** (359→379), so they're a separate failure mode, now the leading error class and the target for iteration 2.
 
-| metric | iter 0 (baseline) | iter 1 (pooled client) |
-|--------|-------------------|------------------------|
-| ok | 1585 | _TBD_ |
-| timeouts | 510 | _TBD_ |
-| http errors | 359 | _TBD_ |
-| client errors | 546 | _TBD_ |
-| achieved RPS | 8.33 | _TBD_ |
-| latency P50 / P95 / P99 | 85.6 / 115.1 / 119.6 s | _TBD_ |
+| metric | iter 0 (baseline) | iter 1 (pooled client) | Δ |
+|--------|-------------------|------------------------|---|
+| ok | 1585 | **2599** | +1014 |
+| timeouts | 510 | **7** | −503 |
+| http errors | 359 | 379 | +20 |
+| client errors | 546 | **15** | −531 |
+| achieved RPS | 8.33 | 8.33 | — |
+| latency P50 / P95 / P99 | 85.6 / 115.1 / 119.6 s | **78.9 / 99.8 / 105.6 s** | −7 / −15 / −14 s |
 
-> Capture the agent "Errors & SLO" row during the run (`screenshots/grafana_load_iter1.png`) and compare `client errors` and `agent_inflight_requests` against the baseline. Expect the biggest drop in client errors; if timeouts persist, the bottleneck is concurrency (→ improvement #2) rather than connection churn.
+Note the SLO is still missed by a mile (P95 100 s vs 5 s target) — this iteration fixed *errors*, not latency. The latency wall is the next problem: the agent is still synchronous and serializing through a bounded threadpool while each request does 2–3 vLLM calls. achieved RPS stayed pinned at 8.33, the signature of a hard concurrency ceiling.
+
+> Capture the agent "Errors & SLO" row during the run (`screenshots/grafana_load_iter1.png`). The big visible change vs baseline is `client errors` near zero and `agent_inflight_requests` no longer climbing unbounded.
+
+### Iteration 2 — (next) diagnose the remaining 379 http_errors
+
+- **Saw:** http_errors flat at ~360–379 across both runs (~12% of requests), independent of connection pooling. Sequential curls never 500; only concurrency triggers them → an overload-induced failure inside `graph.invoke`, surfaced as `HTTPException(500)`.
+- **Next:** the driver now captures the 500 response body into `results/load_test.json`, so the next load run reveals the exact exception (expected: `APITimeoutError`/`APIConnectionError` from agent→vLLM under deep queue, or a vLLM-side error). Fix follows the evidence — _to be filled in._
 
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._

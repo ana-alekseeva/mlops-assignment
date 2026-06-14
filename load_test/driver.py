@@ -42,10 +42,12 @@ async def fire_one(
     err: str | None = None
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-            await resp.read()
+            raw = await resp.read()
             if resp.status != 200:
                 status = "http_error"
-                err = f"HTTP {resp.status}"
+                # Capture the body - the agent puts the real exception in
+                # {"detail": "..."} - so errors are diagnosable post-run.
+                err = f"HTTP {resp.status}: {raw.decode('utf-8', 'replace')[:300]}"
     except asyncio.TimeoutError:
         status = "timeout"
     except Exception as e:  # noqa: BLE001

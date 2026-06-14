@@ -8,10 +8,13 @@ agent's final SQL, the result rows, and per-iteration history.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+
+logger = logging.getLogger("agent.server")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -114,7 +117,9 @@ def _trace_metadata(req: AnswerRequest) -> dict[str, Any]:
         **req.tags,
         "db_id": req.db,
         "model": VLLM_MODEL,
-        "max_iterations": MAX_ITERATIONS,
+        # Stringified: Langfuse propagates plain metadata as OTEL span attributes,
+        # which must be strings - a non-string value is dropped with a warning.
+        "max_iterations": str(MAX_ITERATIONS),
         # Reserved Langfuse keys consumed by the LangChain callback handler.
         "langfuse_trace_name": "sql-agent",
         "langfuse_tags": tags,
@@ -144,6 +149,10 @@ def answer(req: AnswerRequest) -> AnswerResponse:
             final = graph.invoke(state, config=config)
         except Exception as e:  # noqa: BLE001
             outcome = "exception"
+            # Full traceback to the server log so the cause of a 500 (e.g. an
+            # agent->vLLM APITimeoutError under load) is visible, not just the
+            # class+message echoed to the caller.
+            logger.exception("graph.invoke failed for db=%s", req.db)
             raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
         sql = final.get("sql", "")
