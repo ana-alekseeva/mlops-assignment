@@ -7,3 +7,11 @@ scrape_configs:
     static_configs:
       - targets: ['host.docker.internal:8000']
     metrics_path: /metrics
+
+  # The agent (FastAPI on host:8001) exposes its own /metrics: end-to-end
+  # latency (the SLO) and outcome counters, so agent/HTTP-level errors that
+  # never reach vLLM are visible in Grafana.
+  - job_name: agent
+    static_configs:
+      - targets: ['host.docker.internal:8001']
+    metrics_path: /metrics

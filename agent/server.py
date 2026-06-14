@@ -9,11 +9,13 @@ agent's final SQL, the result rows, and per-iteration history.
 from __future__ import annotations
 
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 from pydantic import BaseModel
 
 load_dotenv()
@@ -45,6 +47,28 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Prometheus instrumentation for the agent itself. vLLM's /metrics only sees the
+# per-call inference layer; the end-to-end agent latency (the actual SLO) and the
+# agent/HTTP-level failures the load driver counts live HERE and were previously
+# invisible to Grafana. Exposed at /metrics and scraped as the "agent" job.
+AGENT_REQUESTS = Counter(
+    "agent_requests_total",
+    "Agent /answer requests by outcome.",
+    ["outcome"],  # ok | agent_error (200 but SQL failed) | exception (500)
+)
+AGENT_LATENCY = Histogram(
+    "agent_request_latency_seconds",
+    "End-to-end /answer latency - the SLO boundary (target P95 < 5s).",
+    # Buckets span the SLO (5s) and the overload tail seen under load (>120s).
+    buckets=(0.25, 0.5, 1, 2, 3, 5, 7.5, 10, 20, 30, 60, 120, float("inf")),
+)
+AGENT_INFLIGHT = Gauge(
+    "agent_inflight_requests",
+    "Agent /answer requests currently being processed (concurrency).",
+)
+# Mounted sub-app so GET /metrics returns the Prometheus exposition format.
+app.mount("/metrics", make_asgi_app())
+
 
 class AnswerRequest(BaseModel):
     question: str
@@ -68,56 +92,69 @@ def health() -> dict[str, str]:
 
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
-    state = AgentState(question=req.question, db_id=req.db)
-    # Best-practice trace shaping via Langfuse's reserved metadata keys: a stable
-    # trace name, tags for filtering, the db under test, and a session id (the
-    # caller's "phase" tag by default) so a whole eval/load run groups together.
-    metadata: dict[str, Any] = {
-        **req.tags,
-        "langfuse_trace_name": "sql-agent",
-        "langfuse_tags": ["sql-agent", "text-to-sql"],
-        "db_id": req.db,
-    }
-    session_id = req.tags.get("session_id") or req.tags.get("phase")
-    if session_id:
-        metadata["langfuse_session_id"] = session_id
-    config: dict[str, Any] = {
-        "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": metadata,
-    }
+    # outcome/latency/in-flight are recorded in finally so every path - including
+    # the 500 below - is counted. outcome stays "ok" unless we set it otherwise.
+    t0 = time.monotonic()
+    outcome = "ok"
+    AGENT_INFLIGHT.inc()
     try:
-        final = graph.invoke(state, config=config)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        state = AgentState(question=req.question, db_id=req.db)
+        # Best-practice trace shaping via Langfuse's reserved metadata keys: a stable
+        # trace name, tags for filtering, the db under test, and a session id (the
+        # caller's "phase" tag by default) so a whole eval/load run groups together.
+        metadata: dict[str, Any] = {
+            **req.tags,
+            "langfuse_trace_name": "sql-agent",
+            "langfuse_tags": ["sql-agent", "text-to-sql"],
+            "db_id": req.db,
+        }
+        session_id = req.tags.get("session_id") or req.tags.get("phase")
+        if session_id:
+            metadata["langfuse_session_id"] = session_id
+        config: dict[str, Any] = {
+            "callbacks": [_lf_handler] if _lf_handler is not None else [],
+            "metadata": metadata,
+        }
+        try:
+            final = graph.invoke(state, config=config)
+        except Exception as e:  # noqa: BLE001
+            outcome = "exception"
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
-    sql = final.get("sql", "")
-    iteration = final.get("iteration", 0)
-    history = final.get("history", [])
-    execution = final.get("execution")
+        sql = final.get("sql", "")
+        iteration = final.get("iteration", 0)
+        history = final.get("history", [])
+        execution = final.get("execution")
 
-    if execution is None:
+        if execution is None:
+            outcome = "agent_error"
+            return AnswerResponse(
+                sql=sql,
+                rows=None,
+                iterations=iteration,
+                ok=False,
+                error="agent produced no execution result",
+                history=history,
+            )
+        if not execution.ok:
+            outcome = "agent_error"
+            return AnswerResponse(
+                sql=sql,
+                rows=None,
+                iterations=iteration,
+                ok=False,
+                error=execution.error,
+                history=history,
+            )
+
         return AnswerResponse(
             sql=sql,
-            rows=None,
+            rows=[list(r) for r in (execution.rows or [])],
             iterations=iteration,
-            ok=False,
-            error="agent produced no execution result",
+            ok=True,
             history=history,
         )
-    if not execution.ok:
-        return AnswerResponse(
-            sql=sql,
-            rows=None,
-            iterations=iteration,
-            ok=False,
-            error=execution.error,
-            history=history,
-        )
-
-    return AnswerResponse(
-        sql=sql,
-        rows=[list(r) for r in (execution.rows or [])],
-        iterations=iteration,
-        ok=True,
-        history=history,
-    )
+    finally:
+        AGENT_LATENCY.observe(time.monotonic() - t0)
+        AGENT_REQUESTS.labels(outcome=outcome).inc()
+        AGENT_INFLIGHT.dec()
