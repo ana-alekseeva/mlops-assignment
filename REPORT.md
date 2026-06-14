@@ -275,16 +275,86 @@ Iteration 3 settled the diagnosis: prefix cache is ~90% hit, prompts are small, 
 
 Load-weighted that's roughly **2.4 → ~1.5 calls/request (~−40%)**, which should translate fairly directly into a shallower decode batch and lower P95.
 
-**Result — pending the next load run** (`uv run python load_test/driver.py --rps 10 --duration 300`) and a Phase 5 re-run. Predicted:
+**Result — biggest latency win yet, but it broke the accuracy gate, so the verify-skip was reverted (→ Iteration 5).** Measured:
 
-| metric | iter 3 | iter 4 — predicted | confirms if |
-|--------|--------|--------------------|-------------|
-| vLLM calls / request (load-wt) | ~2.4 | **~1.5** | the verify-skip + cap fire as modeled |
-| P95 latency | 62.4 s | → materially lower (target: toward 5 s) | decode batch was the wall |
-| `vllm:num_requests_running` | deep, stable | shallower at the same offered RPS | fewer concurrent decode streams |
-| Phase 5 execution accuracy | baseline | **unchanged (±1 question)** | skipped work wasn't lifting accuracy |
+| metric | iter 3 | iter 4 | read |
+|--------|--------|--------|------|
+| P50 latency | 17.1 s | **1.19 s** | −93% — the call-count cut hit decode directly |
+| P95 latency | 62.4 s | **20.1 s** | −68% |
+| P99 latency | 73.9 s | **30.6 s** | −59% |
+| latency max | 119.1 s | 103.7 s | tail still has stragglers |
+| ok / http_errors / client_errors | 2932 / 1 / 60 | 2979 / **0** / 16 | cleaner under the shallower batch |
+| **Phase 5 accuracy** | 0.40 (baseline) | **0.333 (10/30)** | **regressed — the blocker** |
 
-**Caveat — this iteration trades a safety check for throughput, so the eval gate is mandatory, not optional.** Skipping verify means a non-empty-but-wrong result (right rows, wrong columns) is no longer LLM-checked, and `MAX_ITERATIONS=2` drops the 2nd revise. Both are justified by the flat Phase-5 pass rate, but that was a 30-question sample — **re-run `uv run python evals/run_eval.py` and confirm execution accuracy holds before adopting.** If accuracy drops, the cheapest partial rollback is to keep the verify-skip (the big win) but restore `MAX_ITERATIONS=3`. If P95 still misses after this, the bottleneck is raw decode throughput and the remaining levers are vLLM-side: FP8 KV-cache and a `--max-num-seqs` sweep.
+The latency hypothesis was confirmed hard: fewer serial calls → a shallower decode batch → P50 collapsed 17 s → 1.2 s. But the eval regressed 0.40 → 0.333.
+
+**Reading the regression carefully — most of it is noise, but the risk is real.** The eval reported `iter_0` (first-generation) pass rate = 0.30, down from baseline 0.40. The verify-skip changes only what happens *after* generation, so it **cannot** lower first-generation accuracy — that 0.40→0.30 swing (3 questions on n=30) is vLLM nondeterminism / sampling variance on a tiny eval. Revise actually *helped* this run (iter_0 0.30 → iter_1 0.333). So the headline drop is mostly measurement noise on a 30-question set. **But** the verify-skip genuinely removes the check on a non-empty-but-wrong result, and at n=30 we can't prove that's harmless — so the prudent call is to keep the safety net and recover the latency from the decode side instead. That is Iteration 5.
+
+**What was kept vs reverted:** the latency win shows the path is right (cut work / shrink the batch), so we keep everything that didn't touch correctness — `max-model-len 8192`, `max-num-seqs 256`, prefix caching, the cell cap — and revert only the verify-skip. `MAX_ITERATIONS=2` stays (Phase 5: the 2nd revise never lifted the pass rate; revise itself is preserved).
+
+### Iteration 5 — recover the iter-4 latency on the decode side, with the verifier kept
+
+Iteration 4 proved that shrinking the decode batch is what moves P95, but it bought the batch reduction by dropping a correctness check. Iteration 5 keeps the verifier and gets decode cheaper *per token* instead of by skipping work.
+
+**Saw.** Iter-4's P50 1.2 s / P95 20 s came with an accuracy gate failure; iter-3's safe config sat at P95 62 s. We want iter-4-class latency at iter-3-class (or better) accuracy. The decode step is KV-bandwidth-bound (every step re-reads the full KV cache from HBM across the ~170-deep batch), and outputs are short, so the levers are: cheaper KV reads, no prefill stalls, and a bounded output tail.
+
+**Changed** (revert + three decode levers; verifier and prompts intact):
+- **(revert verify-skip)** [`agent/graph.py`](agent/graph.py): `route_after_execute` removed, `execute → verify` restored. Every result is LLM-checked again; the verify→revise loop is back. `MAX_ITERATIONS` stays 2.
+- **(FP8 KV cache)** [`scripts/start_vllm.sh`](scripts/start_vllm.sh) `--kv-cache-dtype fp8`: halves the per-step KV read (the decode bottleneck) and ~doubles KV capacity for deeper batches without preemption. The top decode lever once call-count is fixed.
+- **(chunked prefill)** `--enable-chunked-prefill`: interleaves the ~7.3k-token prefills with decode so a big prompt can't stall the running batch's token generation — protects decode tail latency (max was still ~104 s in iter 4). Default-on in V1; explicit for the graded config.
+- **(bounded output)** [`agent/graph.py`](agent/graph.py) `llm(max_tokens=512)`: caps a runaway generation from holding decode slots; ample for real SQL / the JSON verdict.
+
+**Result — pending the next load run + Phase 5 re-run.** Predicted:
+
+**Result — eval done; the first run's "crash" was a vLLM warmup artifact, not a regression.** The first eval after restarting vLLM (for the new FP8-KV flags) reported `overall 0.267` with **9 `agent_failures`** and an `iteration_distribution` `"0": 9` — i.e. 9 questions never completed a generate→execute cycle. Diagnosed by reproducing: the failing questions return HTTP 500 from `/answer`, and re-running the exact same questions a moment later **succeeds** (`ok:true`, correct rows). Re-running the whole eval once vLLM was warm:
+
+| metric | baseline | iter 5 — cold (1st run) | iter 5 — warm (re-run) |
+|--------|----------|-------------------------|------------------------|
+| `agent_failures` | 0 | **9** | **0** |
+| overall pass rate | 0.40 | 0.267 | **0.30** |
+| `iter_0` (first-gen) | 0.40 | 0.233 | 0.267 |
+| `iteration_distribution` | — | `{0:9, 1:13, 2:8}` | `{1:19, 2:11}` |
+| avg latency (sequential) | — | 0.94 s | 0.63 s |
+
+Reads:
+1. **The reliability "regression" was the eval racing vLLM's restart.** The 9 failures were per-call timeouts / not-ready 500s while the freshly-restarted engine (new FP8-KV config) was still loading; they vanish warm. Lesson baked in for next time: **gate the eval/load runs on vLLM readiness** (poll `/health` + one warmup request) before measuring — don't start the moment the process launches.
+2. **Quality is intact relative to what this dev model can show.** Warm accuracy 0.30 vs 0.40 baseline is a 3-question spread on `n=30`, and it lives in `iter_0` (first-generation) — but the generate path is byte-identical across every iteration, so the iter-5 levers (verify-revert, FP8 KV, `max_tokens`) *cannot* be the cause. It's FP8-dev-model nondeterminism + small-sample noise. Per this report's own rule (final numbers must come from **bf16 on the H100**), the FP8 dev eval isn't the surface to chase 0.30-vs-0.40 on; it confirms *no failure*, not a precise pass rate.
+3. **Latent fragility found while debugging:** the agent's *default* `VLLM_MODEL` is the bf16 id `Qwen/Qwen3-30B-A3B-Instruct-2507`, but dev vLLM serves `...-2507-FP8`. The server happens to `load_dotenv()` so it picks up the right id, but any entry point that doesn't → every call 404s. Worth aligning the default or failing loudly on a model-not-found at startup.
+
+**Latency under load — the decode levers paid off, with the verifier kept.** Measured (`--rps 10 --duration 300`, vLLM warm-gated):
+
+| metric | iter 3 (full verify, no FP8-KV) | iter 4 (verify dropped) | **iter 5 (verify kept + decode levers)** |
+|--------|----------------------------------|--------------------------|------------------------------------------|
+| P50 latency | 17.1 s | 1.19 s | **10.4 s** |
+| P95 latency | 62.4 s | 20.1 s | **47.9 s** (−23% vs iter 3) |
+| P99 latency | 73.9 s | 30.6 s | **58.5 s** |
+| latency max | 119 s | 104 s | **97.5 s** |
+| ok / http_errors / client_errors | 2932 / 1 / 60 | 2979 / 0 / 16 | 2917 / **0** / 77 |
+
+What it confirms:
+1. **FP8 KV + chunked prefill cut P95 62 → 48 s (−23%) and max 119 → 97 s at no accuracy cost** — exactly the "cheaper decode, no dropped work" trade iter 4 couldn't make. The verifier is back and P95 still fell. The lower max is chunked prefill removing the prefill-stall stragglers, as predicted.
+2. **The batch got shallower via faster decode, not less work.** Little's law on the iter-5 P50: L ≈ λ·W ≈ 10 × 10.4 ≈ **105 in-flight**, down from iter-3's ~170 — the FP8-KV decode speedup let the steady-state batch drain faster at the same 10 RPS.
+3. **The verify call's price is now quantified: ~28 s of P95** (iter 5's 48 s with verify vs iter 4's 20 s without). That single extra serial call per request keeps the batch deep — which is exactly what **Iteration 6 Lever 1 (single-token verify)** attacks: keep the check, shrink its decode, and aim to recover most of iter-4's latency without iter-4's accuracy risk.
+
+`client_errors` ticked 16 → 77 (`ClientOSError`, socket churn) — expected, since restoring verify deepens the batch and the concurrency vs iter 4; still 2.6% and `http_errors` stayed at 0.
+
+**Status vs SLO.** P95 47.9 s still misses the 5 s target by ~10×, but the trajectory is set and the next move is identified and measured-into: the verify call is the dominant remaining serial cost, so Iteration 6 starts there, then the `--max-num-seqs` sweep, then (gated) n-gram speculative decoding. See Iteration 6.
+
+### Iteration 6 (planned) — reasoning for the next decode-latency cut
+
+_Written before the run; to be promoted to a measured iteration once iter-5's FP8-KV numbers are in. The ordering is deliberate: cheapest-and-safest first, structural-but-risky last, and the one lever that can backfire (spec decoding) gated on a precondition._
+
+**Where we are.** Decode is throughput-bound: at 10 RPS the system reaches a *stable* deep batch (~170 in-flight, iter-3), and latency is the time a request spends sharing the GPU with that batch. By Little's law the SLO defines the target directly — P95 < 5 s at λ = 10 RPS needs in-flight L = λ·W ≈ **50**, versus ~170 today. So every remaining lever must do one of two things: **raise decode throughput** (so the steady-state batch for a given arrival rate is shallower) or **emit fewer decode tokens** (so each request leaves the batch sooner). Input-side work is already exhausted (prefix cache 90%, prompts bounded, schema small).
+
+**Lever 1 — make `verify` cheap instead of absent (top pick: keeps accuracy, cuts decode).** Iteration 4 showed the verify call is the main extra decode cost, but removing it broke the accuracy gate. The synthesis: *keep the call, shrink its output.* `verify` currently decodes a JSON object (`{"ok": true, "issue": ""}`, ~12 tokens) on every request, the vast majority of which are `ok`. Change the contract so the happy verdict is a **single token** (e.g. `OK`) and the `issue` string is emitted only on rejection. Decode cost scales with output-tokens × concurrency, so cutting the common verdict ~12→1 token removes most of verify's contribution to the batch *without dropping the check* — directly addressing "keep revise, lower decode." Low risk: the verdict parser (`_parse_verdict`) is already defensive and would just learn the bare-token form. Validate on the eval like any prompt change.
+
+**Lever 2 — `--max-num-seqs` sweep, measurement-driven.** With `max-model-len 8192` and FP8 KV (iter 5) each sequence's KV footprint dropped ~4–8×, so more sequences now fit. A deeper running batch raises decode throughput (amortizes the MoE weight/expert loads over more tokens per step) until HBM bandwidth saturates. Don't guess the value — read `vllm:gpu_cache_usage_perc`, `vllm:num_requests_waiting`, and any preemption counter under load: if KV sits underused while requests wait, raise `--max-num-seqs`; if KV saturates and preemption climbs, that's the ceiling and the lever is exhausted. Cheap, no accuracy risk, pure serving config.
+
+**Lever 3 — speculative decoding, but only n-gram and only once the batch is shallow.** Spec decoding trades spare compute for fewer *sequential* decode steps, so it wins when the GPU is memory-bandwidth-bound with idle FLOPs (shallow batch) and **loses** when compute-saturated (deep batch) because the draft/verify work competes with the batch and cuts aggregate throughput — which would *raise* P95 in our current regime. Two consequences: (a) it's gated on Levers 1–2 first shrinking the batch enough to be latency-bound rather than throughput-bound; (b) prefer **n-gram / prompt-lookup** speculation (no draft model, near-zero overhead) over a draft-model/EAGLE setup, because text-to-SQL is an unusually good fit — generated SQL copies table/column identifiers and literals verbatim from the schema+question prompt, so prompt-lookup acceptance should be high. It must be A/B'd **under the real concurrent load**, not single-stream, since concurrency is exactly what blunts it. Treat as an experiment with a clear kill criterion: if throughput drops, revert.
+
+**Lever 4 — last resort, accept the floor.** If P95 still misses 5 s with accuracy intact after 1–3, the honest conclusion is that one H100 at 10 RPS with a 2–3-call agent is at its decode floor, and the remaining moves are out-of-scope for serving tuning: shrink the agent to a single call (the iter-4 path, only viable if a future eval shows verify isn't needed), or scale horizontally (more replicas behind the agent). Report the floor rather than chasing it with risky kernels.
+
+**Order of operations:** Lever 1 (cheap verify) → re-measure; Lever 2 (max-num-seqs sweep) → re-measure; only then Lever 3 (n-gram spec, gated). Each behind a Phase 5 eval re-run, one change at a time, so the metric movement stays attributable — same discipline as iters 0–5.
 
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._
