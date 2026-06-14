@@ -399,5 +399,46 @@ Every iteration so far localizes us to **(b)**: flat steady-state latency (iter 
 
 **Result — pending** (vLLM was down at write time; run the diagnostic when it's back up). Expected: KV usage below saturation → offload not pursued, and the finding recorded is *why* (bottleneck is decode throughput, not KV capacity) rather than a latency number. This is the same "shrink decode work / speed up decode" thesis as iters 4–6; offload is orthogonal to it.
 
+### Iteration 8 — feed the GPU: token throughput + CPU isolation
+
+**Saw — the bottleneck may not be the GPU at all.** Two observations reframed the whole decode story:
+- **Low token throughput** relative to requests — a 3B-active MoE on an H100 should sustain hundreds–thousands of generation tok/s aggregate, far above what was observed.
+- **The host is CPU-contended on 8 physical cores (16 threads).** At a glance, competing for CPU: the agent (`uvicorn`), `VLLM::EngineCore`, and the *entire* observability stack — `clickhouse` (~15 %), `langfuse-web`/`-worker`, plus a stray debug agent that was pegging a full core (killed). The vLLM tuning docs warn explicitly: *"the engine core process runs a busy loop and is particularly sensitive to CPU starvation; minimum 2 + N physical cores."* Meanwhile GPU memory showed 76/81 GB used but **0 % util at idle** — KV is over-provisioned and *not* the constraint (consistent with iter-7).
+
+**Diagnosis.** The likely culprit for low throughput is **CPU starvation of vLLM's engine-core busy loop**: on 8 cores, the agent + driver + ClickHouse/Langfuse crowd out the loop that schedules and dispatches batches, so the GPU is *underfed* rather than saturated. That makes the earlier "decode-saturated deep batch" picture partly a **feeding** problem — cheaper to fix than a GPU ceiling. (Separately, `--max-num-batched-tokens` was never set, so it sat on the low default that caps tokens/step.)
+
+**Changed** (config + isolation; observability stays fully ON):
+- **(throughput knob)** [`scripts/start_vllm.sh`](scripts/start_vllm.sh) `--max-num-batched-tokens 8192` — the per-step token budget; default (~2048 with chunked prefill) caps the effective batch. Docs: *">8192 for throughput, especially smaller models on large GPUs."*
+- **(CPU isolation — keep o11y on, stop the starvation)** [`docker-compose.override.yml`](docker-compose.override.yml) (new; auto-merged, base compose untouched) boxes the whole observability stack into cores **0–3** (`cpuset`, plus `cpus` caps so ClickHouse/Langfuse self-size their thread pools to the cgroup quota). [`scripts/start_vllm.sh`](scripts/start_vllm.sh) pins vLLM to the **complementary cores 4–15** via `taskset` (`VLLM_CPUS`, skipped cleanly if `taskset` absent). Observability runs fully; it just can't preempt the engine loop.
+- **(measurement)** [`scripts/sample_throughput.sh`](scripts/sample_throughput.sh) (new) samples `:8000/metrics` + `nvidia-smi` during a run: aggregate & per-request gen tok/s, batch depth, KV %, and **GPU util** — the gauge that decides the diagnosis.
+
+**The decisive test (run during the next load run):**
+
+| GPU util under load | meaning | next move |
+|---------------------|---------|-----------|
+| **low (< ~90 %)** | vLLM is **starved/underfed** | the CPU-isolation fixes above are the win; verify throughput jumps |
+| **~100 %** | genuine GPU/kernel ceiling | serving config — raise `--max-num-batched-tokens` further, or A/B drop `--kv-cache-dtype fp8` |
+
+**Result — the biggest win of the project: it *was* CPU starvation.** Accuracy unchanged (**0.40, 0 `agent_failures`**, revise on 6/30 — pure serving/placement, agent logic untouched). The load run:
+
+| metric | iter 3 (safe) | iter 6 (best w/ verify) | iter 8 (CPU-isolated + fed) |
+|--------|---------------|--------------------------|------------------------------|
+| P50 | 17.1 s | 12.4 s | **1.02 s** |
+| P95 | 62.4 s | 39.0 s | **10.2 s** (−74 % vs iter 6) |
+| P99 | 73.9 s | 51.0 s | **16.8 s** |
+| latency max | 119 s | 98 s | **63 s** |
+| ok / http_errors / client_errors | 2932 / 1 / 60 | 2949 / 0 / 47 | 2956 / 0 / 40 |
+
+The `scripts/sample_throughput.sh` trace settles every open question:
+- **Steady state (t ≥ 200 s): ~1,000–1,100 generation tok/s aggregate (peaks 1,850), GPU util pinned at 100 %.** That is ~50× the "20 tok/s" seen before — confirming that figure was the **starved/underfed** regime, not a GPU ceiling. Freeing the engine loop's cores let the GPU run flat out.
+- **Batch depth fell to ~10 concurrent** (was ~170): requests now finish in ~1 s, so fewer are resident (Little's law, L ≈ 10 × 1). The system flipped from *throughput-bound on a deep starved batch* to *GPU-bound on a shallow fast one*.
+- **Throughput is flat from t = 200 → 495 s** — no progressive degradation, which means the suspected "second-half slowdown" (B) was mostly a symptom of starvation + cold-start backlog and is **resolved** by this fix.
+
+**Verdict.** CPU isolation (cores 0–3 for o11y, 4–15 for vLLM) + `--max-num-batched-tokens 8192` cut P95 **39 → 10.2 s (−74 %)** and P50 **12.4 → 1.02 s**, at zero accuracy cost, with observability fully on. Versus the iter-3 safe config it's P95 62 → 10 s (−84 %). The bottleneck was never the GPU or the KV cache (iter 7) — it was **feeding the GPU**, exactly as the vLLM docs' "engine core busy loop is sensitive to CPU starvation" warning predicted.
+
+**Status vs SLO.** P50 **1.0 s** is comfortably under the 5 s target; P95 **10.2 s** is now within ~2× of it (was ~12×). The remaining gap is the **tail**, and the regime has changed: now genuinely GPU-bound at 100 % util on a *shallow* batch — which is finally the regime where **n-gram/prompt-lookup speculative decoding** (Iteration 6, Lever 3) can help, since there's idle FLOP headroom at low batch and SQL copies identifiers verbatim from the prompt. That, an fp8-KV A/B, and tail-variance reduction (the revise path) are the levers to close 10 → 5 s.
+
+**Optional further o11y reduction (if needed, without turning it off):** set `LANGFUSE_SAMPLE_RATE` (e.g. `0.1`) during load tests so the agent only ships ~10 % of traces to Langfuse — cuts per-request span overhead *inside* the agent and ingestion load on ClickHouse, while the Prometheus metrics (the actual SLO source) stay complete. Leave it at 1.0 for normal runs where you want every trace.
+
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._

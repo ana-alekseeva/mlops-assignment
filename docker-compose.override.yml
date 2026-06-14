@@ -1,0 +1,25 @@
+# Phase 6 / iteration 8 — CPU isolation for the observability stack.
+#
+# Why: this box has 8 physical cores (16 threads). The vLLM engine core runs a
+# busy loop on the host and is starved when the o11y stack — ClickHouse above all
+# — fights it for CPU, which tanks token throughput (iter-8 symptom). The fix is
+# isolation, not shutdown: box the whole stack into a few cores and pin vLLM to
+# the complementary cores (taskset in scripts/start_vllm.sh). Observability stays
+# FULLY ON; it just can't preempt the engine loop anymore.
+#
+# `docker compose up -d` auto-merges this over docker-compose.yml. cpuset binds a
+# service to specific cores; cpus caps its total CPU and lets ClickHouse/Langfuse
+# self-size their thread pools to the cgroup quota instead of to all 16 threads.
+#
+# Keep the cpuset here the COMPLEMENT of VLLM_CPUS in start_vllm.sh:
+#   o11y -> cores 0-3   |   vLLM -> cores 4-15
+# Adjust both together for a different core count.
+services:
+  prometheus:      { cpuset: "0-3" }
+  grafana:         { cpuset: "0-3" }
+  postgres:        { cpuset: "0-3", cpus: 1.0 }
+  clickhouse:      { cpuset: "0-3", cpus: 2.0 }
+  redis:           { cpuset: "0-3" }
+  minio:           { cpuset: "0-3" }
+  langfuse-worker: { cpuset: "0-3", cpus: 1.5 }
+  langfuse-web:    { cpuset: "0-3", cpus: 1.0 }

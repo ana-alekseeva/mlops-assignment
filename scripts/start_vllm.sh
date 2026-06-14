@@ -71,12 +71,34 @@ if [[ "${ENABLE_KV_OFFLOAD:-0}" == "1" ]]; then
     OFFLOAD_ARGS=(--swap-space "${KV_OFFLOAD_GB:-16}")
 fi
 
-exec uv run python -m vllm.entrypoints.openai.api_server \
+# --max-num-batched-tokens 8192 (Phase 6 / iteration 8): the per-step token
+# budget the scheduler fills from the running batch. Left unset it defaults low
+# (~2048 with chunked prefill), which caps how many decode+prefill tokens run per
+# engine step -> shallow effective batch -> low token throughput, the iter-8
+# symptom. The vLLM tuning docs recommend ">8192 for throughput, especially for
+# smaller models on large GPUs" - a 3B-active MoE on an H100 is exactly that. We
+# match it to max-model-len (8192) so a single max-length prompt still fits one
+# step. Raise further (16384) if GPU util stays high but throughput is still low.
+# CPU pinning (Phase 6 / iteration 8): the vLLM engine core is a busy loop that
+# starves when the agent, the load driver, and the observability stack share its
+# cores. Pin vLLM (and its inherited worker threads) to dedicated cores so the
+# loop always gets scheduled. Keep VLLM_CPUS the COMPLEMENT of the o11y cpuset in
+# docker-compose.override.yml (default: o11y on 0-3, vLLM on 4-15). taskset is
+# optional - skipped cleanly if not installed.
+VLLM_CPUS="${VLLM_CPUS:-4-15}"
+PIN=()
+if command -v taskset >/dev/null 2>&1; then
+    PIN=(taskset -c "$VLLM_CPUS")
+    echo "Pinning vLLM to CPUs $VLLM_CPUS"
+fi
+
+exec "${PIN[@]}" uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
     --port 8000 \
     --max-model-len 8192 \
     --max-num-seqs 256 \
+    --max-num-batched-tokens 8192 \
     --enable-prefix-caching \
     --enable-chunked-prefill \
     --kv-cache-dtype fp8 \
