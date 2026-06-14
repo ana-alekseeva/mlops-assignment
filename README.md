@@ -82,6 +82,9 @@ Once connected and forwarded, run the rest on the VM:
 # 1. Clone repo and install dependencies
 git clone <repo-url>
 cd <repo-folder>
+# System dep: Python dev headers, required for vLLM's torch.compile at startup
+# (without them it fails with: fatal error: Python.h: No such file or directory).
+sudo apt-get update && sudo apt-get install -y python3.12-dev
 uv sync
 
 # 2. Configure environment (Langfuse keys go here in Phase 4)
@@ -90,8 +93,9 @@ cp .env.example .env
 # 3. Load BIRD subset (~500 MB sqlite + JSONs)
 uv run python scripts/load_data.py
 
-# 4. Start the o11y stack
-docker compose up -d
+# 4. Start the o11y stack (needs Docker daemon access). Use sudo, or add yourself
+#    to the docker group once to skip it: sudo usermod -aG docker $USER && newgrp docker
+sudo docker compose up -d
 ```
 
 Sanity-check from your laptop browser:
