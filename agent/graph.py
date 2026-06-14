@@ -16,6 +16,7 @@ conditional router following the same shape.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -68,13 +69,18 @@ def llm() -> ChatOpenAI:
     client fixes that and cuts per-call connect latency. The bounded timeout +
     retries stop a call stuck in vLLM's queue from hanging until the caller's
     120s timeout (which showed up as load-test 'timeouts').
+
+    Phase 6 / iteration 2: timeout tightened 60s -> 10s. The SLO budgets ~1.5s
+    per call (5s end-to-end / ~3 calls), and a healthy call takes <1.3s (Phase 5),
+    so any call past 10s is already an SLO miss and a slot-holder under load -
+    failing it fast frees the worker instead of letting it block for a minute.
     """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
-        timeout=60.0,
+        timeout=10.0,
         max_retries=2,
     )
 
@@ -96,17 +102,21 @@ def _extract_sql(text: str) -> str:
     return (fenced.group(1) if fenced else text).strip()
 
 
-def generate_sql_node(state: AgentState) -> dict:
+async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
     Build messages from the prompts, call the shared llm(), extract the SQL,
     and return only the state fields you changed. `iteration` is bumped here
     (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
 
+    Phase 6 / iteration 2: async (`ainvoke`) so the request runs on the event
+    loop, not a bounded threadpool worker - the LLM call is I/O-bound on vLLM,
+    so awaiting it lets hundreds of requests progress concurrently.
+
     This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
     in prompts.py to make it produce real queries.
     """
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
@@ -121,9 +131,14 @@ def generate_sql_node(state: AgentState) -> dict:
     }
 
 
-def execute_node(state: AgentState) -> dict:
-    """Provided. Runs the SQL and stores the result."""
-    return {"execution": execute_sql(state.db_id, state.sql)}
+async def execute_node(state: AgentState) -> dict:
+    """Provided. Runs the SQL and stores the result.
+
+    Phase 6 / iteration 2: the sqlite call is blocking, so it is offloaded to a
+    worker thread (`asyncio.to_thread`) - otherwise a slow query (up to its 5s
+    timeout) would stall the event loop and freeze every other in-flight request.
+    """
+    return {"execution": await asyncio.to_thread(execute_sql, state.db_id, state.sql)}
 
 
 def _parse_verdict(text: str) -> tuple[bool | None, str]:
@@ -145,7 +160,7 @@ def _parse_verdict(text: str) -> tuple[bool | None, str]:
     return None, text.strip()[:200]
 
 
-def verify_node(state: AgentState) -> dict:
+async def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
     Build messages from the VERIFY_* prompts, call llm(), parse a small
@@ -157,7 +172,7 @@ def verify_node(state: AgentState) -> dict:
     result = state.execution
     result_text = result.render() if result is not None else "ERROR: no execution result"
 
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),
         ("user", prompts.VERIFY_USER.format(
             question=state.question,
@@ -181,7 +196,7 @@ def verify_node(state: AgentState) -> dict:
     }
 
 
-def revise_node(state: AgentState) -> dict:
+async def revise_node(state: AgentState) -> dict:
     """Produce a revised SQL query given state.verify_issue and the prior attempt.
 
     Same shape as generate_sql_node, but the prompt carries the failing SQL,
@@ -191,7 +206,7 @@ def revise_node(state: AgentState) -> dict:
     result = state.execution
     result_text = result.render() if result is not None else "ERROR: no execution result"
 
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,

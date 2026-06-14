@@ -166,10 +166,34 @@ Note the SLO is still missed by a mile (P95 100 s vs 5 s target) — this iterat
 
 > Capture the agent "Errors & SLO" row during the run (`screenshots/grafana_load_iter1.png`). The big visible change vs baseline is `client errors` near zero and `agent_inflight_requests` no longer climbing unbounded.
 
-### Iteration 2 — (next) diagnose the remaining 379 http_errors
+### Iteration 2 — async agent (remove the 40-thread concurrency ceiling)
 
-- **Saw:** http_errors flat at ~360–379 across both runs (~12% of requests), independent of connection pooling. Sequential curls never 500; only concurrency triggers them → an overload-induced failure inside `graph.invoke`, surfaced as `HTTPException(500)`.
-- **Next:** the driver now captures the 500 response body into `results/load_test.json`, so the next load run reveals the exact exception (expected: `APITimeoutError`/`APIConnectionError` from agent→vLLM under deep queue, or a vLLM-side error). Fix follows the evidence — _to be filled in._
+This iteration pulls forward improvement #5 ("make the agent async"), which was deferred at iteration 0. The iter-1 result is what forced it: pooling fixed the *error* classes but barely moved *latency*, which isolates the remaining problem to the agent's concurrency model rather than its connections.
+
+**Saw — three metrics that, together, point at the orchestration layer, not inference:**
+
+1. **vLLM is clean while the agent drowns.** Across both prior runs vLLM's `/metrics` reports every completion as `finished_reason="stop"` with zero inference errors, yet the agent's `agent_request_latency_seconds` P95 sits at ~100 s. The SLO is missed entirely at a layer vLLM can't see — the agent, not a single inference call, is the bottleneck.
+2. **Pooling fixed errors but not latency — they decoupled.** Iteration 1 cut `client_errors` 546→15 and `timeouts` 510→7, but P95 moved only 115→100 s and P50 only 86→79 s. If the latency wall were connection-level, pooling would have collapsed it too. It didn't → the residual wall is *structural concurrency*, not socket churn.
+3. **`http_errors` are flat and concurrency-only.** They held at 359→379 (~12% of requests) across both runs, independent of connection pooling, and never reproduce on sequential `curl`s — only concurrency triggers them. That is the signature of an overload-induced failure *inside* `graph.invoke`, surfaced as `HTTPException(500)`.
+
+**Diagnosis (why those three are one bug).** FastAPI runs a **sync** `def answer` ([`agent/server.py`](agent/server.py)) calling a **sync** `graph.invoke` on Starlette's bounded **anyio threadpool — 40 threads by default**. Each request holds one thread for its *entire* 2–3-serial-vLLM-call chain, so useful concurrency is capped at ~40 no matter how many requests arrive. Apply **Little's law** to the iter-1 numbers: with arrivals λ ≈ 10 req/s and in-system time W ≈ P50 79 s, the resident request count is L = λ·W ≈ **790 requests**, but only **40** can run at once → ~750 sit queued behind a 40-wide gate. *That queue is the latency.* And the tail explains finding 3: a request that waits in that queue past the iter-1 `timeout=60 s` raises `APITimeoutError`/`APIConnectionError` from agent→vLLM inside `graph.invoke` → `HTTPException(500)` → `http_error`. The 500 bodies now captured in `results/load_test.json` are expected to confirm exactly those exception types — same root cause as the latency wall, not a separate bug.
+
+**Hypothesized.** Removing the 40-thread ceiling — make the whole request path async so concurrency is bounded by the event loop + the httpx pool + vLLM's own batching, not by 40 OS threads — should let vLLM finally receive the concurrent load it has been idle-waiting for (finding 1), collapse the queue-driven latency (finding 2), and eliminate the queue-timeout 500s (finding 3), with **no change to the graph logic or prompts** (so Phase 5 accuracy is unaffected).
+
+**Changed.** Primary change (async), plus one companion infra change that ships with it because it only bites *under* the concurrency this iteration unlocks — neither touches graph logic or prompts:
+- **(async — the main lever)** [`agent/server.py`](agent/server.py): `answer` is now `async def` and awaits `graph.ainvoke(...)` — the endpoint runs on the event loop instead of the threadpool. The Prometheus `try/finally` instrumentation is unchanged. [`agent/graph.py`](agent/graph.py): the three LLM nodes (`generate_sql`, `verify`, `revise`) are `async def` and `await llm().ainvoke(...)` (the cached, pooled client from iter 1 is reused — it already holds an `httpx.AsyncClient`). `execute_node` is `async def` and offloads the blocking sqlite call via `asyncio.to_thread(...)` so a slow query can't stall the event loop for all in-flight requests. The pure nodes (`_attach_schema`, `route_after_verify`) stay sync.
+- **(timeout)** [`agent/graph.py`](agent/graph.py) `llm()`: per-call `timeout` tightened **60 s → 10 s**. The SLO budgets ~1.5 s/call (5 s end-to-end ÷ ~3 calls) and a healthy call takes <1.3 s (Phase 5), so any call past 10 s is already an SLO miss *and* a slot-holder under load — failing it fast frees the worker instead of letting it block for a minute. Eval calls (~0.85–1.28 s) are nowhere near 10 s, so Phase 5 accuracy is unaffected.
+
+**Result — pending the next load run on the H100** (`uv run python load_test/driver.py --rps 10 --duration 300 --run-label iter2-async`). Predicted direction, and the exact metrics that confirm or refute the hypothesis:
+
+| metric | iter 1 (pooled) | iter 2 (async) — predicted | confirms if |
+|--------|-----------------|----------------------------|-------------|
+| achieved RPS | 8.33 | → ~10.0 | driver no longer outruns the server |
+| `agent_inflight_requests` | plateaus ~40 (thread cap) | rises with offered load, no 40-wall | the ceiling is gone |
+| http_errors | 379 | → near 0 | queue-timeout 500s were the cause |
+| P95 latency | 99.8 s | → collapses toward the vLLM-bound floor | latency was queueing, not inference |
+
+If P95 *doesn't* collapse after this, the bottleneck has moved into vLLM itself (batching/KV), which is the cue to start the Phase 1 server levers (Iteration 3: `--max-model-len 4096`, prefix-cache hit-rate check, then FP8). _Numbers to be filled in once the load run is captured (plus `screenshots/grafana_load_iter2.png` — watch `agent_inflight_requests` no longer pinned at ~40)._
 
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._

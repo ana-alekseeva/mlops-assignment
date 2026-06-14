@@ -133,7 +133,13 @@ def _trace_metadata(req: AnswerRequest) -> dict[str, Any]:
 
 
 @app.post("/answer", response_model=AnswerResponse)
-def answer(req: AnswerRequest) -> AnswerResponse:
+async def answer(req: AnswerRequest) -> AnswerResponse:
+    # Phase 6 / iteration 2: async endpoint + graph.ainvoke. The request now runs
+    # on the event loop instead of Starlette's bounded (~40) threadpool, so the
+    # 2-3 I/O-bound vLLM calls per request no longer pin an OS thread for the whole
+    # chain - hundreds of requests can be in flight, bounded by the httpx pool and
+    # vLLM's batching rather than a 40-wide gate (see REPORT.md Phase 6 iter 2).
+    #
     # outcome/latency/in-flight are recorded in finally so every path - including
     # the 500 below - is counted. outcome stays "ok" unless we set it otherwise.
     t0 = time.monotonic()
@@ -146,7 +152,7 @@ def answer(req: AnswerRequest) -> AnswerResponse:
             "metadata": _trace_metadata(req),
         }
         try:
-            final = graph.invoke(state, config=config)
+            final = await graph.ainvoke(state, config=config)
         except Exception as e:  # noqa: BLE001
             outcome = "exception"
             # Full traceback to the server log so the cause of a 500 (e.g. an
