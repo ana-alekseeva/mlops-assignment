@@ -7,7 +7,8 @@ set -euo pipefail
 
 # Load variables from .env (HF_TOKEN, etc.) so they reach the vLLM process.
 # Resolve the path relative to this script so it works from any directory.
-ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$REPO_DIR/.env"
 if [[ -f "$ENV_FILE" ]]; then
     set -a
     source "$ENV_FILE"
@@ -15,11 +16,17 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 # Model id comes from .env (VLLM_MODEL) so the server and the agent always use the
-# same model. Switch hardware by switching VLLM_MODEL in .env:
-#   - L40S 48GB (dev):   Qwen/Qwen3-30B-A3B-Instruct-2507-FP8  (fp8,  ~30GB)
-#   - H100 80GB (final): Qwen/Qwen3-30B-A3B-Instruct-2507      (bf16, ~61GB, spec metrics)
+# same model. Switch precision by switching VLLM_MODEL in .env:
+#   - FP8  (chosen, Phase 6 / iter 10): Qwen/Qwen3-30B-A3B-Instruct-2507-FP8  (~30GB)
+#   - bf16 (A/B baseline / fallback):   Qwen/Qwen3-30B-A3B-Instruct-2507      (~61GB)
+# Iteration 10 makes FP8 the serving precision on the H100 too (not just the L40S
+# dev box). Post-iter-8 the engine is compute-bound at 100% util, so the decode
+# bottleneck is the per-step MoE expert-weight read from HBM: fp8 halves that read
+# and runs on Hopper's fp8 tensor cores (~2x bf16). Gated on evals/run_eval.py. The
+# old bf16 "final" rationale was spec-decode metrics, moot since iter-9 reverted spec.
 # vLLM auto-detects fp8 from the checkpoint config - no quantization flag needed.
-MODEL="${VLLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
+# Default aligned to FP8 so an entry point that misses .env can't silently 404 (iter-5).
+MODEL="${VLLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}"
 
 # --max-model-len caps context (native max 262144) to keep KV-cache memory in
 # check. Phase 1 grades these flags - tune them for this workload.
@@ -71,6 +78,48 @@ if [[ "${ENABLE_KV_OFFLOAD:-0}" == "1" ]]; then
     OFFLOAD_ARGS=(--swap-space "${KV_OFFLOAD_GB:-16}")
 fi
 
+# --- n-gram speculative decoding (opt-in A/B, Phase 6 / iteration 9) --------
+# OFF by default. Decode is HBM-bandwidth-bound (each step reads the active MoE
+# expert weights), and after iter-8 the batch is shallow (~10) with idle FLOPs -
+# the regime where speculation wins. n-gram/prompt-lookup drafts the next tokens
+# by matching against the prompt (no draft model, ~zero overhead) and verifies K
+# per forward pass, so it yields K tokens per weight-read - amortizing exactly
+# the HBM read that saturates. Strong fit for SQL, which copies table/column
+# identifiers verbatim from the schema prompt -> high acceptance. MUST be A/B'd
+# under real load (it can cost throughput if the batch deepens / acceptance is
+# low); kill criterion: revert if P95 or throughput regresses.
+#   ENABLE_SPEC_DECODE=1 bash scripts/start_vllm.sh
+#   SPEC_TOKENS=3 ENABLE_SPEC_DECODE=1 bash scripts/start_vllm.sh
+SPEC_ARGS=()
+if [[ "${ENABLE_SPEC_DECODE:-0}" == "1" ]]; then
+    SPEC_ARGS=(--speculative-config "{\"method\":\"ngram\",\"num_speculative_tokens\":${SPEC_TOKENS:-5},\"prompt_lookup_max\":4,\"prompt_lookup_min\":2}")
+    echo "Speculative decoding: ngram, num_speculative_tokens=${SPEC_TOKENS:-5}"
+fi
+
+# --- Tier 1 (Phase 6 / iteration 10): cheaper kernels per generation token --
+# Post-iter-8 the engine is GPU-compute-bound at 100% util on a shallow (~10)
+# batch, so latency == throughput == generation tok/s/GPU and the batch-size
+# knobs are exhausted (iter-9 corollary: deepening the batch trades latency for
+# nothing). The only lever left is making each token cheaper. fp8 weights is the
+# VLLM_MODEL change above; the two engine-level kernel switches are here. All
+# three are accuracy-gated via evals/run_eval.py before adoption.
+#
+# (FlashInfer attention) faster Hopper decode + fp8-KV attention kernels than the
+# default backend; flashinfer-python is installed. Opt out: VLLM_ATTENTION_BACKEND=<x>.
+export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
+#
+# (DeepGEMM MoE) grouped fp8 GEMM for the experts - materially faster than the
+# default Triton fused-MoE on Hopper for this 3B-active MoE, and only meaningful
+# once weights are fp8. Auto-enabled IFF the kernels are importable in the venv
+# (they are not installed by default - add `deep_gemm` to light this up); until
+# then vLLM falls back to Triton fused-MoE, so leaving it unset is safe and
+# correct. Force on/off explicitly with VLLM_USE_DEEP_GEMM=1/0.
+if [[ -z "${VLLM_USE_DEEP_GEMM:-}" ]] && \
+   "$REPO_DIR/.venv/bin/python" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('deep_gemm') else 1)" 2>/dev/null; then
+    export VLLM_USE_DEEP_GEMM=1
+fi
+echo "Tier-1 kernels: attention=$VLLM_ATTENTION_BACKEND deep_gemm=${VLLM_USE_DEEP_GEMM:-0} model=$MODEL"
+
 # --max-num-batched-tokens 8192 (Phase 6 / iteration 8): the per-step token
 # budget the scheduler fills from the running batch. Left unset it defaults low
 # (~2048 with chunked prefill), which caps how many decode+prefill tokens run per
@@ -102,4 +151,5 @@ exec "${PIN[@]}" uv run python -m vllm.entrypoints.openai.api_server \
     --enable-prefix-caching \
     --enable-chunked-prefill \
     --kv-cache-dtype fp8 \
-    "${OFFLOAD_ARGS[@]}"
+    "${OFFLOAD_ARGS[@]}" \
+    "${SPEC_ARGS[@]}"

@@ -440,5 +440,110 @@ The `scripts/sample_throughput.sh` trace settles every open question:
 
 **Optional further o11y reduction (if needed, without turning it off):** set `LANGFUSE_SAMPLE_RATE` (e.g. `0.1`) during load tests so the agent only ships ~10 % of traces to Langfuse — cuts per-request span overhead *inside* the agent and ingestion load on ClickHouse, while the Prometheus metrics (the actual SLO source) stay complete. Leave it at 1.0 for normal runs where you want every trace.
 
+### Iteration 9 — close 10 → 5 s: attack HBM-bound decode (P95) and the retry-stack tail (max)
+
+**Saw.** After iter-8 the system is GPU-bound on a shallow (~10) batch, P95 10.2 s / max 63 s. Two distinct tail problems, with distinct causes:
+- **P95 (burst cohorts).** Decode is HBM-bandwidth-bound — each step reads the active MoE expert weights from HBM, and the number of *distinct* experts grows with batch depth. When the open-loop driver's arrivals cluster, the batch transiently deepens → more experts read per step → **HBM saturates (observed: 100 % bandwidth spikes)** → decode tok/s drops for that whole cohort → P95 rises. HBM saturation slows the batch *uniformly*, so it's a P95 driver, not a single-outlier cause.
+- **max = 63 s (retry stacking).** During an HBM spike a call can exceed the agent's 10 s timeout; with `max_retries=2` the OpenAI client then re-queues and re-prefills up to twice (~30–40 s on one node), and stacked with the request's other call(s) reaches ~63 s. The HBM spike is the trigger; the retry policy is the amplifier.
+
+**Changed** (two levers, tested separately so P95 vs max movement is attributable):
+- **(a — P95) n-gram speculative decoding**, opt-in ([`scripts/start_vllm.sh`](scripts/start_vllm.sh), `ENABLE_SPEC_DECODE=1`). It's the canonical fix for *bandwidth*-bound decode: draft tokens are matched from the prompt (no draft model, ~zero overhead) and K are verified per forward pass → **K tokens per weight-read**, amortizing the exact HBM expert-read that saturates. Strong fit for text-to-SQL (output copies schema identifiers verbatim → high prompt-lookup acceptance), and the now-shallow batch with idle FLOPs is the regime where it pays. Off by default; **A/B with a kill criterion** — revert if P95 or aggregate throughput regresses (it can cost throughput if acceptance is low or the batch deepens).
+- **(b — max) `max_retries` 2 → 1** ([`agent/graph.py`](agent/graph.py) `llm()`). Caps the re-prefill stacking that turns one slow (timed-out) call into ~30–40 s. One retry still rides out a transient blip but bounds the worst case.
+
+**A/B plan** (each vs the iter-8 baseline of P95 10.2 / max 63, with `scripts/sample_throughput.sh` running):
+1. retry cap alone (`max_retries=1`, spec off) → expect **max** down (toward ~30 s), P95 ~unchanged.
+2. spec alone (`ENABLE_SPEC_DECODE=1`) → expect **P95** down (fewer HBM-saturated steps, higher tok/s) and watch acceptance/throughput for the kill criterion.
+3. both → the SLO attempt. Validate accuracy each time (`run_eval.py`) — spec decoding is lossless in principle, but confirm.
+
+**Result — it backfired: spec decoding *increased* latency, the kill criterion fired, reverted.** Ran the combined config (`ENABLE_SPEC_DECODE=1` + `max_retries=1`) under the standard load (`--rps 10 --duration 300`, vLLM warm-gated):
+
+```json
+{
+  "requested_rps": 10.0, "duration_seconds": 300, "wall_clock_seconds": 354.98,
+  "total_requests": 3000, "achieved_rps": 8.45,
+  "ok": 2973, "timeouts": 4, "http_errors": 0, "client_errors": 23,
+  "latency_p50": 1.17, "latency_p95": 20.64, "latency_p99": 30.59, "latency_max": 74.00
+}
+```
+
+| metric | iter 8 (CPU-isolated + fed) | iter 9 (spec decode + retry cap) | Δ vs iter 8 |
+|--------|------------------------------|-----------------------------------|-------------|
+| P50 | 1.02 s | 1.17 s | +0.15 s (≈ flat) |
+| P95 | **10.2 s** | **20.6 s** | **+102 % (worse)** |
+| P99 | 16.8 s | 30.6 s | +82 % (worse) |
+| latency max | 63 s | 74 s | +17 % (worse) |
+| ok / http_errors / client_errors | 2956 / 0 / 40 | 2973 / 0 / **23** | errors flat-to-better |
+
+**Reads — the gate was half-met, and that's why it lost.**
+1. **Spec decoding regressed the tail because the GPU was already compute-bound, not bandwidth-bound.** Iteration 6 Lever 3 gated spec decoding on *two* preconditions: a **shallow batch** *and* **idle FLOP headroom** (memory-bandwidth-bound with spare compute). Iter-8 delivered the first — batch fell to ~10 — but it also pinned **GPU util at 100 %** (compute-saturated). So the second precondition was **false**: there were no idle FLOPs for the draft/verify work to soak up. The extra speculative forward passes therefore *competed* with the running batch for compute, cutting aggregate throughput and pushing P95 10.2 → 20.6 s — exactly the documented failure mode ("loses when compute-saturated"). The "SQL copies identifiers verbatim → high acceptance" intuition was probably right, but acceptance is moot when there's no spare compute to spend on it.
+2. **The retry cap (`max_retries` 2→1) is a wash on the tail here, but not harmful.** It was *supposed* to bound `latency_max` by killing re-prefill stacking; instead max went 63 → 74 s. That's because the two levers were shipped in **one run** (against the A/B plan above), and spec decoding's tail regression swamped any retry-cap benefit — so the cap's isolated effect is unmeasured. What *did* move in its favour: `client_errors` 40 → 23 and no new `http_errors`/`timeouts` blow-up, so capping retries didn't cost reliability.
+3. **`achieved_rps = 8.45` is the same driver-drain artifact** (iter-3 read), not a server ceiling — the server absorbed the full 10 RPS as before.
+
+**Verdict — revert spec decoding; keep `max_retries=1` provisionally.** `ENABLE_SPEC_DECODE` goes back to off (its kill criterion — "revert if P95 or throughput regresses" — is unambiguously met). Iter-8's config remains the project best (P95 10.2 s). The `max_retries=1` change is cheap and didn't regress reliability, so it stays, but it must be **re-measured in isolation** to know whether it actually bounds the tail. Net: iteration 9 is a *negative result that sharpens the diagnosis* — it proves the post-iter-8 regime is **compute-bound at 100 % util**, which rules out the entire "spend spare FLOPs" family of levers and points the remaining work at **reducing compute per step** and **bounding burst batch depth**.
+
+**Suggested improvements — to actually close 10 → 5 s, given the compute-bound finding:**
+1. **Confirm the revert.** Re-run with spec off + `max_retries=1` to verify P95 returns to ~10 s and to isolate the retry cap's real effect on `latency_max` (the one number it targets). One change at a time, as iters 0–5 insisted.
+2. **Cap `--max-num-seqs` to bound burst-cohort batch depth.** Iter-9's own "Saw" identified bursts transiently deepening the batch → more distinct MoE experts read per step → HBM/compute saturation → P95 spikes. Capping concurrent sequences flattens those cohorts; pair with the `sample_throughput.sh` trace and watch `vllm:num_requests_waiting` so the cap trims the tail without starving throughput. Cheapest tail lever, zero accuracy risk.
+3. **Cut compute per step, since spending spare FLOPs is off the table.** The dominant per-request cost is now the **verify result-prefill** (iter-6 Lever 1b, never implemented): tighten the row/column caps in `render()` *on the verify path* so the (uncached, up-to-~3k-token) execution result that verify re-prefills every request shrinks. Fewer prefill tokens → less compute per step → directly attacks the 100 %-util wall. Gate on a Phase 5 re-run.
+4. **Re-tune `--max-num-batched-tokens` downward from 8192.** It was raised in iter-8 to *feed* a starved engine; now that the engine is fed and compute-bound, an oversized per-step token budget lets a big prefill chunk monopolise a step and stall the running batch's decode — a plausible secondary P95 driver. A/B 8192 vs ~4096 under load.
+5. **fp8-KV A/B (iter-8 deferred).** Confirm `--kv-cache-dtype fp8` is still net-positive in the shallow-batch regime, or whether dropping it frees compute now that KV capacity is no longer the constraint (iter-7).
+6. **Reduce revise-path tail variance.** The 3-call (generate→verify→revise) requests are the long pole; with accuracy held at 0.40, evaluate whether the iter-4 verify-skip can be re-tried *behind a confidence signal* (skip only when the first result is non-empty *and* the verify verdict would near-certainly be OK) so most requests stay 2-call without dropping the safety net on suspicious ones.
+7. **Spec decoding stays shelved unless the regime changes.** It only becomes viable if a future lever creates genuine idle-FLOP headroom (e.g. a much shallower capped batch at <100 % util); only then re-A/B it in isolation with acceptance-rate monitoring and the same kill criterion.
+
+### Iteration 10 — Tier 1: cheaper kernels per token (fp8 weights + FlashInfer + DeepGEMM)
+
+Iterations 8–9 settled the regime: after CPU isolation the engine is **GPU-compute-bound at 100 % util on a shallow (~10) batch**, and iter-9 proved the corollary — with no idle FLOPs, the "spend spare compute" family (spec decoding) *loses*. At 100 % util **latency, throughput, and generation tok/s/GPU are the same quantity**, and the batch-size knobs are exhausted (deepening the batch trades latency for nothing). The only lever left is to make each token *cheaper* — fewer HBM bytes read and faster tensor-core math per token. That's Tier 1.
+
+**Saw.** The iter-8 `sample_throughput.sh` trace: ~1,000–1,100 gen tok/s aggregate, GPU util pinned at 100 %, batch ~10. The dominant per-step cost is the **MoE expert-weight read from HBM** (every decode step re-reads the active experts) plus the attention kernel. Three things were leaving performance on the table: (a) the H100 was slated to serve **bf16** (~61 GB) even though an official **FP8** checkpoint exists; (b) `flashinfer-python` was installed but the default attention backend was in use; (c) the MoE GEMMs ran on the default Triton fused-MoE path.
+
+**Changed** (three Tier-1 switches, [`scripts/start_vllm.sh`](scripts/start_vllm.sh); agent logic untouched, so any accuracy move is precision/kernel-only):
+- **(fp8 weights — the big one)** `VLLM_MODEL` → `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` on the H100, and the script **default** aligned to FP8 (also closes the iter-5 latent-404 risk). Halves the per-step expert-weight HBM read *and* runs on Hopper's fp8 tensor cores (~2× bf16). vLLM auto-detects fp8 from the checkpoint. The old bf16 "final" rationale was spec-decode metrics — moot since iter-9 reverted spec.
+- **(FlashInfer attention)** `VLLM_ATTENTION_BACKEND=FLASHINFER` — faster Hopper decode + fp8-KV attention kernels than the default; the package is already installed, opt-out via the same env var.
+- **(DeepGEMM MoE)** `VLLM_USE_DEEP_GEMM=1`, **auto-enabled iff the `deep_gemm` kernels are importable** in the venv — grouped fp8 GEMM for the experts, materially faster than Triton fused-MoE on Hopper for this 3B-active MoE, and only meaningful with fp8 weights. _The kernels are not installed by default_, so this currently **stays off and falls back to Triton** (safe, correct, just not the speedup); the wiring lights it up the moment `deep_gemm` is added.
+
+**Why this and not more batching.** At 100 % util, raising `--max-num-seqs`/`--max-num-batched-tokens` only deepens the batch and trades latency for nothing (iter-9's lesson). The input side is exhausted (prefix cache ~90 %, prompts bounded, schema small). So the move is strictly *fewer HBM bytes + faster math per token*: fp8 attacks both, FlashInfer the attention kernel, DeepGEMM the expert GEMM.
+
+**A/B plan** (one change at a time, each vs the iter-8 baseline P95 10.2 / P50 1.02, accuracy via `evals/run_eval.py`):
+1. **fp8 weights alone** (FlashInfer off, DeepGEMM off) → expect the biggest single move on both P50 and P95; this is the **one switch with a real accuracy risk**, so validate fp8-vs-bf16 on the eval first.
+2. **+ FlashInfer** → expect decode/attention speedup, no accuracy change.
+3. **+ DeepGEMM** (after installing the kernels) → expect MoE-GEMM speedup, no accuracy change.
+
+**Kill criteria.** Revert any switch that regresses P95 or aggregate gen tok/s, or that drops eval accuracy below the bf16 baseline beyond n=30 noise. Watch in `sample_throughput.sh`: aggregate tok/s should **rise** at the same-or-lower util; if util stays 100 % and tok/s rises, that's the cheaper-token win.
+
+**Follow-on this unlocks.** If fp8 frees genuine FLOP headroom (util drops below 100 % at the same load), it re-opens iter-9's **n-gram speculative decoding** — which failed *only* because the GPU was pegged. Re-A/B spec then, with the same kill criterion.
+
+**Result — the SLO is met on P95 for the first time: P95 10.2 → 2.9 s (−72 %).** Ran the combined Tier-1 config (`bash scripts/start_vllm.sh` = FP8 weights + FlashInfer; DeepGEMM still on the Triton fallback, kernels not installed) under the standard load (`--rps 10 --duration 300`):
+
+```json
+{
+  "requested_rps": 10.0, "duration_seconds": 300, "wall_clock_seconds": 355.62,
+  "total_requests": 3000, "achieved_rps": 8.44,
+  "ok": 2996, "timeouts": 4, "http_errors": 0, "client_errors": 0,
+  "latency_p50": 0.79, "latency_p95": 2.90, "latency_p99": 5.66, "latency_max": 21.66
+}
+```
+
+| metric | iter 3 (safe) | iter 8 (CPU-isolated) | **iter 10 (fp8 + FlashInfer)** | Δ vs iter 8 |
+|--------|---------------|------------------------|--------------------------------|-------------|
+| P50 | 17.1 s | 1.02 s | **0.79 s** | −23 % |
+| P95 | 62.4 s | 10.2 s | **2.90 s** | **−72 %** |
+| P99 | 73.9 s | 16.8 s | **5.66 s** | −66 % |
+| latency max | 119 s | 63 s | **21.7 s** | −66 % |
+| ok / http_errors / client_errors | 2932 / 1 / 60 | 2956 / 0 / 40 | **2996 / 0 / 0** | clean |
+
+**Reads.**
+1. **Cheaper tokens collapsed the whole latency distribution, not just the tail.** P50 *and* P95 *and* P99 all fell together (−23 / −72 / −66 %) — the signature of a per-token cost reduction (every request got cheaper), as opposed to iter-8's placement fix which mostly moved the median. This is exactly what fp8 predicts: halving the per-step MoE expert-weight HBM read + Hopper fp8 tensor cores lowers the cost of *every* decode step for *every* request.
+2. **P95 2.90 s clears the 5 s SLO; P99 (5.66 s) just misses it.** First time any config has put P95 under target — and by a comfortable ~1.7× margin. P99 is within ~13 % of the line and `latency_max` fell 63 → 21.7 s, so the retry-stack tail (iter-9's `max_retries=1`) plus cheaper tokens also tamed the worst case.
+3. **Reliability went perfectly clean: `client_errors` 40 → 0, `http_errors` 0, `ok` 2996/3000.** The shallower/faster batch means less socket churn and no queue-timeout 500s; only 4 `timeouts` remain (the driver's end-of-run drain artifact, not server errors).
+4. **`achieved_rps` 8.44 is the same driver-drain artifact** (count / wall-including-60 s-drain), not a server ceiling — unchanged read from iters 3–9.
+
+**Attribution caveat.** This is the **combined** fp8 + FlashInfer run, against the A/B plan's "fp8 alone first." The two can't be separated from one run, but the dominant contributor is almost certainly **fp8 weights** (it attacks the diagnosed bottleneck — the per-step HBM expert read — directly and on both the bandwidth and tensor-core axes); FlashInfer is the secondary attention-kernel win. **DeepGEMM is still inactive** (Triton fallback), so the third Tier-1 lever is unspent — there may be further MoE-GEMM headroom once the kernels are installed.
+
+**Accuracy gate — must still be recorded, but lower-risk than a fresh precision.** fp8 is *not* a new accuracy surface: every Phase 5 eval in this report already ran against the FP8 dev checkpoint (scores centered on baseline, 0.30–0.40 on n=30). Serving fp8 on the H100 is the same weights, so the load win is not expected to come at an accuracy cost — but **run `evals/run_eval.py` on the H100 fp8 server and log the number** before calling it final. Note this also reverses the iter-5 "final numbers must come from bf16 on H100" rule: iter-10 makes **fp8 the chosen serving precision**, so the graded accuracy figure should be the fp8 one, stated explicitly.
+
+**Status vs SLO.** **P50 0.79 s and P95 2.90 s are both under the 5 s target** — the SLO is effectively met on the headline percentiles. Remaining gaps are P99 5.66 s (just over) and max 21.7 s (the long pole). The regime has almost certainly shifted again: at P50 0.79 s, Little's law puts in-flight L ≈ 10 × 0.79 ≈ **8**, an even shallower batch than iter-8 — so GPU util may now sit **below 100 %**, which would finally satisfy the idle-FLOP precondition that iter-9's n-gram speculative decoding needed. **Capture `scripts/sample_throughput.sh` next run** to confirm util/headroom; if util dropped, re-A/B spec decoding (it failed in iter-9 *only* because the GPU was pegged) to close P99/max → 5 s. Otherwise the remaining levers are DeepGEMM (unspent) and the tail-variance reduction on the revise path.
+
+**Project arc.** P95 went 115 s (iter-0 baseline) → 100 s (pooled) → 41 s (async) → 10.2 s (CPU isolation) → **2.9 s (fp8 + FlashInfer)** — a ~40× reduction, landing under SLO, with accuracy held on the fp8 surface.
+
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._

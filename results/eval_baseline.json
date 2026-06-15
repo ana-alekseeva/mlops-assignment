@@ -13,9 +13,9 @@
     },
     "questions_with_revision": 6,
     "agent_failures": 0,
-    "avg_latency_s": 0.564
+    "avg_latency_s": 0.567
   },
-  "wall_clock_seconds": 18.022227459001442,
+  "wall_clock_seconds": 18.246335050999733,
   "results": [
     {
       "db_id": "formula_1",
@@ -31,7 +31,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.841
+      "latency_s": 0.879
     },
     {
       "db_id": "superhero",
@@ -47,7 +47,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.363
+      "latency_s": 0.369
     },
     {
       "db_id": "california_schools",
@@ -63,7 +63,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.399
+      "latency_s": 0.401
     },
     {
       "db_id": "financial",
@@ -79,7 +79,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.512
+      "latency_s": 0.517
     },
     {
       "db_id": "financial",
@@ -95,7 +95,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.288
+      "latency_s": 0.294
     },
     {
       "db_id": "formula_1",
@@ -111,7 +111,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.695
+      "latency_s": 0.703
     },
     {
       "db_id": "formula_1",
@@ -127,7 +127,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.294
+      "latency_s": 0.296
     },
     {
       "db_id": "student_club",
@@ -143,7 +143,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.724
+      "latency_s": 0.717
     },
     {
       "db_id": "california_schools",
@@ -159,7 +159,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.44
+      "latency_s": 0.437
     },
     {
       "db_id": "toxicology",
@@ -175,7 +175,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.505
+      "latency_s": 0.51
     },
     {
       "db_id": "codebase_community",
@@ -191,7 +191,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.286
+      "latency_s": 0.283
     },
     {
       "db_id": "thrombosis_prediction",
@@ -207,7 +207,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.42
+      "latency_s": 0.415
     },
     {
       "db_id": "superhero",
@@ -223,7 +223,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.351
+      "latency_s": 0.344
     },
     {
       "db_id": "card_games",
@@ -239,7 +239,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.406
+      "latency_s": 0.411
     },
     {
       "db_id": "thrombosis_prediction",
@@ -255,7 +255,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.475
+      "latency_s": 0.474
     },
     {
       "db_id": "codebase_community",
@@ -272,7 +272,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 1.561
+      "latency_s": 1.563
     },
     {
       "db_id": "student_club",
@@ -288,7 +288,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.315
+      "latency_s": 0.318
     },
     {
       "db_id": "card_games",
@@ -305,7 +305,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.619
+      "latency_s": 0.615
     },
     {
       "db_id": "california_schools",
@@ -321,7 +321,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.381
+      "latency_s": 0.392
     },
     {
       "db_id": "financial",
@@ -337,7 +337,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.323
+      "latency_s": 0.326
     },
     {
       "db_id": "formula_1",
@@ -353,7 +353,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.226
+      "latency_s": 0.233
     },
     {
       "db_id": "superhero",
@@ -369,7 +369,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.421
+      "latency_s": 0.425
     },
     {
       "db_id": "student_club",
@@ -385,7 +385,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.261
+      "latency_s": 0.266
     },
     {
       "db_id": "codebase_community",
@@ -401,7 +401,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.369
+      "latency_s": 0.37
     },
     {
       "db_id": "thrombosis_prediction",
@@ -434,7 +434,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.541
+      "latency_s": 0.538
     },
     {
       "db_id": "student_club",
@@ -451,7 +451,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.804
+      "latency_s": 0.805
     },
     {
       "db_id": "card_games",
@@ -468,7 +468,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 1.166
+      "latency_s": 1.173
     },
     {
       "db_id": "codebase_community",
@@ -484,7 +484,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.522
+      "latency_s": 0.531
     },
     {
       "db_id": "codebase_community",

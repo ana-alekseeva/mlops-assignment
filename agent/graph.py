@@ -89,6 +89,13 @@ def llm() -> ChatOpenAI:
     outputs are short (a single SELECT, or a one-line JSON verdict); 512 is ample
     headroom for a complex query yet caps a pathological runaway generation that
     would otherwise hold decode slots in the (decode-bound) batch indefinitely.
+
+    Phase 6 / iteration 9: max_retries 2 -> 1 to cap the latency *max*. A call
+    that exceeds the 10s timeout (e.g. when an HBM-bandwidth burst slows decode)
+    was retried up to 2x - each retry re-queues and re-prefills the request, so
+    the stack reached ~30-40s on a single node and produced the ~63s tail. One
+    retry still rides out a transient blip but bounds the worst case; combined
+    with spec decoding (fewer timeouts) this targets the tail directly.
     """
     return ChatOpenAI(
         model=VLLM_MODEL,
@@ -96,7 +103,7 @@ def llm() -> ChatOpenAI:
         api_key=LLM_API_KEY,
         temperature=0.0,
         timeout=10.0,
-        max_retries=2,
+        max_retries=1,
         max_tokens=512,
     )
 
