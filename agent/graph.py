@@ -34,6 +34,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from agent import prompts
+from agent.evidence import get_evidence
 from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
@@ -59,6 +60,7 @@ class AgentState:
     question: str
     db_id: str
     schema: str = ""
+    evidence: str = ""
     sql: str = ""
     execution: ExecutionResult | None = None
     verify_ok: bool = False
@@ -111,8 +113,8 @@ def llm() -> ChatOpenAI:
 # ---- Nodes ------------------------------------------------------------
 
 def _attach_schema(state: AgentState) -> dict:
-    """Provided. Render the DB schema once at the start of the run."""
-    return {"schema": render_schema(state.db_id)}
+    """Provided. Render the DB schema (and its evidence notes) once per run."""
+    return {"schema": render_schema(state.db_id), "evidence": get_evidence(state.db_id)}
 
 
 def _extract_sql(text: str) -> str:
@@ -143,6 +145,7 @@ async def generate_sql_node(state: AgentState) -> dict:
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
+            evidence=state.evidence,
             question=state.question,
         )),
     ])
@@ -253,6 +256,7 @@ async def revise_node(state: AgentState) -> dict:
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,
+            evidence=state.evidence,
             question=state.question,
             sql=state.sql,
             result=result_text,
