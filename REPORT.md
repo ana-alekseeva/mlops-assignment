@@ -545,5 +545,35 @@ Iterations 8–9 settled the regime: after CPU isolation the engine is **GPU-com
 
 **Project arc.** P95 went 115 s (iter-0 baseline) → 100 s (pooled) → 41 s (async) → 10.2 s (CPU isolation) → **2.9 s (fp8 + FlashInfer)** — a ~40× reduction, landing under SLO, with accuracy held on the fp8 surface.
 
+### Iteration 11 — reduce agent-side latency WITHOUT shedding (zero added errors)
+
+**Saw — a latency regression, located precisely with the Prometheus split.** A `--rps 10 --duration 300` run came back worse than iter-10's P95 2.9 s (P95 24 s in one run, ~8 s in another), with the *error* count staying low. The metric split showed the cost was **not** in vLLM:
+
+| layer | p50 | p95 | p99 |
+|-------|-----|-----|-----|
+| vLLM per inference call (`vllm:e2e_request_latency`) | 0.39 s | 1.43 s | 2.36 s |
+| vLLM time-to-first-token (queue+prefill) | 0.036 s | 0.22 s | 0.39 s |
+| **agent end-to-end** (`agent_request_latency`, ~2.7 calls/req) | **4.0 s** | **24 s** | **34 s** |
+
+vLLM was pristine: `num_requests_waiting` **0**, `num_preemptions_total` **0**, batch depth ~8, prefix-cache hit **90 %**, TTFT 36 ms. The agent's *idle* floor is only **~0.3 s/request** (measured live), so the gap is purely a **concurrency effect**: the agent is a single event loop doing ~27 vLLM round-trips/s, each needing response-parse + LangGraph state + Langfuse span serialization. Under load that per-request CPU makes the loop fall behind and latency inflates together (median *and* tail). At the healthy operating point the system sits at ~4 s P95 — essentially the vLLM-under-load floor (2.7 calls × ~1.4 s) — with ~0 errors, matching iter-10.
+
+**A wrong turn, recorded honestly: admission control made it worse.** The first attempt added an `asyncio.Semaphore(32)` that returned **503** over the bound, plus narrowed `VLLM_CPUS 4-15 → 6-15` to carve cores for a *pinned* agent. Measured result — strictly worse on the metric that matters:
+
+```json
+{ "ok": 2321, "http_errors": 622, "client_errors": 56, "timeouts": 1,
+  "latency_p50": 1.73, "latency_p95": 8.13, "latency_p99": 12.9, "latency_max": 103.9 }
+```
+
+Two mistakes. (1) **The 503s ARE errors** — `agent_requests_total{outcome="rejected"}` was 610–622, i.e. ~20 % of requests turned into HTTP 503 (`http_errors` in the driver). The SLO is *latency*, but converting a slow request into a failed one is not acceptable for a service; shedding is the wrong tool when the fix is to make the work cheaper. (2) The cap of 32 was pinned constantly (`agent_inflight_requests` maxed at exactly 32) because the steady-state in-flight at 10 RPS exceeds 32 once each request takes a few seconds — so it shed continuously, not just on bursts. And narrowing vLLM to 10 cores while the agent stayed *unpinned* (it was launched with plain `uvicorn`, affinity `0-15`) just gave vLLM fewer cores for the same contention. **All of this was reverted.**
+
+**Changed — kept only the levers that cut work per request, never shed one** (graph logic and prompts untouched, so accuracy is unaffected):
+- **(shrink verify prefill)** [`agent/graph.py`](agent/graph.py) `verify_node`: `render(max_rows=3, max_cell=80)` on the verify path only (revise keeps the wider default — it must see the data to fix the query). The verifier needs the answer's *shape*, not the blob; on a wide-text result this trims the uncached prefill from ~2.2 k → ~0.35 k chars on the call verify pays **every** request.
+- **(Langfuse load sampling)** [`.env`](.env) `LANGFUSE_SAMPLE_RATE=0.1`: cuts the per-request span serialization on the event-loop thread (the dominant agent-side CPU under concurrency) and ClickHouse ingestion, keeping ~10 % of traces. No request is dropped — only the tracing overhead is — so latency falls with **zero** error impact. (Set back to 1.0 for Phase-4 trace inspection.) Prometheus metrics, the real SLO source, are unaffected.
+- **(reverted)** admission control / 503 path removed from [`agent/server.py`](agent/server.py); `VLLM_CPUS` restored to `4-15` (iter-8/10 proven config); the experimental `start_agent.sh` pinning removed.
+
+**Why no shedding.** The errors in the bad runs (`http_errors` from my 503s; residual `client_errors` = socket churn from an overloaded, event-loop-starved agent) are all *symptoms of the latency regression*, not independent failures — iter-10 hit **0/0** errors precisely because it ran at the healthy ~4 s point. So the route to zero errors is to restore that point by making each request cheaper (fewer verify-prefill tokens, less tracing CPU), not to reject load.
+
+**Result — pending the next load run.** Expected: agent end-to-end latency returns to the ~4 s P95 floor (verify cap + lighter tracing pulling it slightly under), `http_errors` back to **0** (no 503 path), and `client_errors`/`timeouts` toward 0 as the event loop stops falling behind. Re-run `--rps 10 --duration 300`; confirm via the Prometheus split that the agent-vs-vLLM gap has closed and the `outcome` breakdown shows only `ok`/`agent_error` (no `rejected`). Validate accuracy unchanged (`evals/run_eval.py`). If P95 still drifts up under load, the next *non-shedding* lever is structural concurrency on the agent (multiple uvicorn workers with Prometheus multiprocess mode) so orchestration CPU spreads across cores — explicitly preferred over any form of load rejection.
+
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._

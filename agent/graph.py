@@ -206,7 +206,14 @@ async def verify_node(state: AgentState) -> dict:
     treated as "accept" rather than looping on a parse glitch.
     """
     result = state.execution
-    result_text = result.render() if result is not None else "ERROR: no execution result"
+    # Phase 6 / iteration 11: shrink the verify-path prefill. verify runs on
+    # EVERY request and re-prefills the (uncached) execution result; the iter-6
+    # measurement showed verify's cost is dominated by that prefill, not its
+    # (now 1-token) verdict decode. The verifier only needs the answer's SHAPE -
+    # columns + a few representative values - to judge plausibility, not the full
+    # blob, so cap it hard here (3 rows x 80 chars) while revise keeps the wider
+    # default render() since it has to actually see the data to fix the query.
+    result_text = result.render(max_rows=3, max_cell=80) if result is not None else "ERROR: no execution result"
 
     response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),

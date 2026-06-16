@@ -61,40 +61,14 @@ MODEL="${VLLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}"
 # generation for the running batch - protects decode tail latency under the
 # mixed prefill/decode load of 10 RPS. (Default-on in the V1 engine; explicit
 # here for the graded serving config.)
-# --- CPU KV offload (opt-in experiment, Phase 6 / iteration 7) -------------
-# OFF by default, on purpose. --swap-space lets vLLM spill a preempted request's
-# KV to host RAM instead of recomputing it, raising effective KV *capacity*.
-# It only helps if GPU KV capacity is the binding constraint (preemption/queueing
-# under load). Our bottleneck is decode *throughput*, and offloaded KV must
-# stream back over PCIe (~tens of GB/s vs HBM ~3 TB/s) before it can decode - so
-# this is expected to be neutral-to-negative here, especially after iter-5 (FP8
-# KV + max-model-len 8192) already relieved KV pressure. Run the diagnostic
-# FIRST (vllm:gpu_cache_usage_perc + preemption under load); only A/B this if KV
-# is pegged near 100%.
-#   ENABLE_KV_OFFLOAD=1 bash scripts/start_vllm.sh              # 16 GiB host swap
-#   KV_OFFLOAD_GB=32 ENABLE_KV_OFFLOAD=1 bash scripts/start_vllm.sh
-OFFLOAD_ARGS=()
-if [[ "${ENABLE_KV_OFFLOAD:-0}" == "1" ]]; then
-    OFFLOAD_ARGS=(--swap-space "${KV_OFFLOAD_GB:-16}")
-fi
-
-# --- n-gram speculative decoding (opt-in A/B, Phase 6 / iteration 9) --------
-# OFF by default. Decode is HBM-bandwidth-bound (each step reads the active MoE
-# expert weights), and after iter-8 the batch is shallow (~10) with idle FLOPs -
-# the regime where speculation wins. n-gram/prompt-lookup drafts the next tokens
-# by matching against the prompt (no draft model, ~zero overhead) and verifies K
-# per forward pass, so it yields K tokens per weight-read - amortizing exactly
-# the HBM read that saturates. Strong fit for SQL, which copies table/column
-# identifiers verbatim from the schema prompt -> high acceptance. MUST be A/B'd
-# under real load (it can cost throughput if the batch deepens / acceptance is
-# low); kill criterion: revert if P95 or throughput regresses.
-#   ENABLE_SPEC_DECODE=1 bash scripts/start_vllm.sh
-#   SPEC_TOKENS=3 ENABLE_SPEC_DECODE=1 bash scripts/start_vllm.sh
-SPEC_ARGS=()
-if [[ "${ENABLE_SPEC_DECODE:-0}" == "1" ]]; then
-    SPEC_ARGS=(--speculative-config "{\"method\":\"ngram\",\"num_speculative_tokens\":${SPEC_TOKENS:-5},\"prompt_lookup_max\":4,\"prompt_lookup_min\":2}")
-    echo "Speculative decoding: ngram, num_speculative_tokens=${SPEC_TOKENS:-5}"
-fi
+# Two opt-in experiments were removed here after they were shown to add no value
+# (history kept in REPORT.md):
+#   - CPU KV offload (--swap-space, iter 7): our wall is decode *throughput*, not
+#     KV *capacity* (gpu_cache_usage well under 100%, 0 preemptions), and offloaded
+#     KV must stream back over PCIe before it can decode - neutral-to-negative.
+#   - n-gram speculative decoding (iter 9): measured P95 10.2 -> 20.6s. The GPU is
+#     compute-bound at 100% util, so there are no spare FLOPs for the draft/verify
+#     passes; they just compete with the running batch. Kill criterion met.
 
 # --- Tier 1 (Phase 6 / iteration 10): cheaper kernels per generation token --
 # Post-iter-8 the engine is GPU-compute-bound at 100% util on a shallow (~10)
@@ -150,6 +124,4 @@ exec "${PIN[@]}" uv run python -m vllm.entrypoints.openai.api_server \
     --max-num-batched-tokens 8192 \
     --enable-prefix-caching \
     --enable-chunked-prefill \
-    --kv-cache-dtype fp8 \
-    "${OFFLOAD_ARGS[@]}" \
-    "${SPEC_ARGS[@]}"
+    --kv-cache-dtype fp8

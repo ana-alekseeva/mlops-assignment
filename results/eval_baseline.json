@@ -8,30 +8,31 @@
       "iter_1": 0.4
     },
     "iteration_distribution": {
-      "1": 24,
-      "2": 6
+      "1": 21,
+      "2": 9
     },
-    "questions_with_revision": 6,
+    "questions_with_revision": 9,
     "agent_failures": 0,
-    "avg_latency_s": 0.567
+    "avg_latency_s": 0.58
   },
-  "wall_clock_seconds": 18.246335050999733,
+  "wall_clock_seconds": 18.415317044999938,
   "results": [
     {
       "db_id": "formula_1",
       "question": "What is the coordinates location of the circuits for Australian grand prix?",
       "gold_sql": "SELECT DISTINCT T1.lat, T1.lng FROM circuits AS T1 INNER JOIN races AS T2 ON T2.circuitID = T1.circuitId WHERE T2.name = 'Australian Grand Prix'",
-      "final_sql": "SELECT \"lat\", \"lng\" \nFROM \"circuits\" \nJOIN \"races\" ON \"circuits\".\"circuitId\" = \"races\".\"circuitId\" \nWHERE \"races\".\"name\" = 'Australian Grand Prix';",
+      "final_sql": "SELECT \"lat\", \"lng\" \nFROM \"circuits\" \nWHERE \"name\" = 'Australian Grand Prix';",
       "final_correct": false,
-      "iterations": 1,
-      "num_steps": 1,
+      "iterations": 2,
+      "num_steps": 2,
       "per_iteration_correct": [
+        false,
         false
       ],
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.879
+      "latency_s": 0.617
     },
     {
       "db_id": "superhero",
@@ -47,7 +48,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.369
+      "latency_s": 0.358
     },
     {
       "db_id": "california_schools",
@@ -63,7 +64,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.401
+      "latency_s": 0.347
     },
     {
       "db_id": "financial",
@@ -79,7 +80,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.517
+      "latency_s": 0.469
     },
     {
       "db_id": "financial",
@@ -95,23 +96,24 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.294
+      "latency_s": 0.282
     },
     {
       "db_id": "formula_1",
       "question": "What is the average fastest lap time in seconds for Lewis Hamilton in all the Formula_1 races?",
       "gold_sql": "SELECT AVG(CAST(SUBSTR(T2.fastestLapTime, 1, INSTR(T2.fastestLapTime, ':') - 1) AS INTEGER) * 60 + CAST(SUBSTR(T2.fastestLapTime, INSTR(T2.fastestLapTime, ':') + 1) AS REAL)) FROM drivers AS T1 INNER JOIN results AS T2 ON T1.driverId = T2.driverId WHERE T1.surname = 'Hamilton' AND T1.forename = 'Lewis'",
-      "final_sql": "SELECT AVG(CAST(SUBSTR(\"fastestLapTime\", 1, 2) AS REAL) * 60 + CAST(SUBSTR(\"fastestLapTime\", 4, 2) AS REAL) + CAST(SUBSTR(\"fastestLapTime\", 7, 3) AS REAL) / 1000) AS average_fastest_lap_seconds\nFROM \"results\" r\nJOIN \"drivers\" d ON r.\"driverId\" = d.\"driverId\"\nWHERE d.\"forename\" = 'Lewis' AND d.\"surname\" = 'Hamilton';",
+      "final_sql": "SELECT AVG(CAST(REPLACE(REPLACE(r.\"fastestLapTime\", 'm', '.'), 's', '') AS REAL)) AS average_fastest_lap_time_seconds\nFROM \"results\" r\nJOIN \"drivers\" d ON r.\"driverId\" = d.\"driverId\"\nWHERE d.\"forename\" = 'Lewis' AND d.\"surname\" = 'Hamilton'\n  AND r.\"fastestLapTime\" IS NOT NULL\n  AND LENGTH(r.\"fastestLapTime\") > 0;",
       "final_correct": false,
-      "iterations": 1,
-      "num_steps": 1,
+      "iterations": 2,
+      "num_steps": 2,
       "per_iteration_correct": [
+        false,
         false
       ],
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.703
+      "latency_s": 1.479
     },
     {
       "db_id": "formula_1",
@@ -127,7 +129,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.296
+      "latency_s": 0.297
     },
     {
       "db_id": "student_club",
@@ -143,7 +145,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.717
+      "latency_s": 0.671
     },
     {
       "db_id": "california_schools",
@@ -159,13 +161,13 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.437
+      "latency_s": 0.438
     },
     {
       "db_id": "toxicology",
       "question": "Calculate the percentage of carcinogenic molecules which contain the Chlorine element.",
       "gold_sql": "SELECT COUNT(CASE WHEN T2.label = '+' AND T1.element = 'cl' THEN T2.molecule_id ELSE NULL END) * 100 / COUNT(T2.molecule_id) FROM atom AS T1 INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id",
-      "final_sql": "SELECT \n  CAST(SUM(CASE WHEN m.label = 'carcinogenic' AND a.element = 'Cl' THEN 1 ELSE 0 END) AS FLOAT) * 100 / COUNT(CASE WHEN m.label = 'carcinogenic' THEN 1 END) AS percentage\nFROM molecule m\nJOIN atom a ON m.molecule_id = a.molecule_id\nWHERE m.label = 'carcinogenic';",
+      "final_sql": "SELECT \n  CAST(SUM(CASE WHEN m.label = 'carcinogenic' AND a.element = 'Cl' THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / COUNT(*) AS percentage\nFROM molecule m\nJOIN atom a ON m.molecule_id = a.molecule_id\nWHERE m.label = 'carcinogenic';",
       "final_correct": false,
       "iterations": 1,
       "num_steps": 1,
@@ -175,7 +177,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.51
+      "latency_s": 0.437
     },
     {
       "db_id": "codebase_community",
@@ -191,7 +193,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.283
+      "latency_s": 0.238
     },
     {
       "db_id": "thrombosis_prediction",
@@ -207,7 +209,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.415
+      "latency_s": 0.374
     },
     {
       "db_id": "superhero",
@@ -223,7 +225,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.344
+      "latency_s": 0.343
     },
     {
       "db_id": "card_games",
@@ -239,7 +241,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.411
+      "latency_s": 0.356
     },
     {
       "db_id": "thrombosis_prediction",
@@ -255,7 +257,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.474
+      "latency_s": 0.473
     },
     {
       "db_id": "codebase_community",
@@ -272,7 +274,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 1.563
+      "latency_s": 1.525
     },
     {
       "db_id": "student_club",
@@ -288,13 +290,13 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.318
+      "latency_s": 0.315
     },
     {
       "db_id": "card_games",
       "question": "What is the type of the card \"Ancestor's Chosen\" as originally printed?",
       "gold_sql": "SELECT originalType FROM cards WHERE name = 'Ancestor''s Chosen' AND originalType IS NOT NULL",
-      "final_sql": "SELECT \"originalType\"\nFROM \"cards\"\nWHERE \"name\" = 'Ancestor''s Chosen'\nLIMIT 1;",
+      "final_sql": "SELECT \"originalType\" \nFROM \"cards\" \nWHERE \"name\" = 'Ancestor''s Chosen' \nLIMIT 1;",
       "final_correct": false,
       "iterations": 2,
       "num_steps": 2,
@@ -305,7 +307,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.615
+      "latency_s": 0.548
     },
     {
       "db_id": "california_schools",
@@ -321,7 +323,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.392
+      "latency_s": 0.389
     },
     {
       "db_id": "financial",
@@ -353,23 +355,24 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.233
+      "latency_s": 0.227
     },
     {
       "db_id": "superhero",
       "question": "In superheroes with missing weight data, calculate the difference between the number of superheroes with blue eyes and no eye color.",
       "gold_sql": "SELECT SUM(CASE WHEN T2.id = 7 THEN 1 ELSE 0 END) - SUM(CASE WHEN T2.id = 1 THEN 1 ELSE 0 END) FROM superhero AS T1 INNER JOIN colour AS T2 ON T1.eye_colour_id = T2.id WHERE T1.weight_kg = 0 OR T1.weight_kg is NULL",
-      "final_sql": "SELECT \n  (SELECT COUNT(*) FROM \"superhero\" s JOIN \"colour\" c ON s.eye_colour_id = c.id WHERE s.weight_kg IS NULL AND c.colour = 'blue') -\n  (SELECT COUNT(*) FROM \"superhero\" s WHERE s.weight_kg IS NULL AND s.eye_colour_id IS NULL) AS difference;",
+      "final_sql": "SELECT \n  (SELECT COUNT(*) FROM \"superhero\" WHERE \"eye_colour_id\" IN (SELECT \"id\" FROM \"colour\" WHERE \"colour\" = 'blue') AND \"weight_kg\" IS NULL) -\n  (SELECT COUNT(*) FROM \"superhero\" WHERE \"eye_colour_id\" IS NULL AND \"weight_kg\" IS NULL) AS difference;",
       "final_correct": false,
-      "iterations": 1,
-      "num_steps": 1,
+      "iterations": 2,
+      "num_steps": 2,
       "per_iteration_correct": [
+        false,
         false
       ],
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.425
+      "latency_s": 0.978
     },
     {
       "db_id": "student_club",
@@ -385,7 +388,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.266
+      "latency_s": 0.259
     },
     {
       "db_id": "codebase_community",
@@ -401,7 +404,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.37
+      "latency_s": 0.369
     },
     {
       "db_id": "thrombosis_prediction",
@@ -418,7 +421,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 1.622
+      "latency_s": 1.594
     },
     {
       "db_id": "toxicology",
@@ -434,13 +437,13 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.538
+      "latency_s": 0.544
     },
     {
       "db_id": "student_club",
       "question": "Please list the full names of the students in the Student_Club that come from the Art and Design Department.",
       "gold_sql": "SELECT T1.first_name, T1.last_name FROM member AS T1 INNER JOIN major AS T2 ON T1.link_to_major = T2.major_id WHERE T2.department = 'Art and Design Department'",
-      "final_sql": "SELECT m.first_name || ' ' || m.last_name AS full_name\nFROM member m\nJOIN major maj ON m.link_to_major = maj.major_id\nWHERE maj.department = 'Art and Design';",
+      "final_sql": "SELECT m.first_name || ' ' || m.last_name AS full_name\nFROM member m\nJOIN major maj ON m.link_to_major = maj.major_id\nWHERE maj.department = 'Art and Design' AND m.member_id IS NOT NULL;",
       "final_correct": false,
       "iterations": 2,
       "num_steps": 2,
@@ -451,13 +454,13 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.805
+      "latency_s": 0.835
     },
     {
       "db_id": "card_games",
       "question": "List all the mythic rarity print cards banned in gladiator format.",
       "gold_sql": "SELECT DISTINCT T1.id FROM cards AS T1 INNER JOIN legalities AS T2 ON T1.uuid = T2.uuid WHERE T2.format = 'gladiator' AND T2.status = 'Banned' AND T1.rarity = 'mythic'",
-      "final_sql": "SELECT c.\"name\"\nFROM \"cards\" c\nJOIN \"legalities\" l ON c.\"uuid\" = l.\"uuid\"\nWHERE c.\"rarity\" = 'mythic'\n  AND l.\"format\" = 'gladiator'\n  AND l.\"status\" = 'banned'\n  AND c.\"isAlternative\" = 0\n  AND c.\"isPromo\" = 0\n  AND c.\"isReprint\" = 0;",
+      "final_sql": "SELECT c.\"name\"\nFROM \"cards\" c\nJOIN \"legalities\" l ON c.\"uuid\" = l.\"uuid\"\nWHERE c.\"rarity\" = 'mythic'\n  AND l.\"format\" = 'Gladiator'\n  AND l.\"status\" = 'banned';",
       "final_correct": false,
       "iterations": 2,
       "num_steps": 2,
@@ -468,7 +471,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 1.173
+      "latency_s": 1.004
     },
     {
       "db_id": "codebase_community",
@@ -484,7 +487,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.531
+      "latency_s": 0.517
     },
     {
       "db_id": "codebase_community",
@@ -501,7 +504,7 @@
       "agent_ok": true,
       "agent_error": null,
       "gold_error": null,
-      "latency_s": 0.783
+      "latency_s": 0.784
     }
   ]
 }
