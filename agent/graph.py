@@ -77,7 +77,11 @@ def llm() -> ChatOpenAI:
         api_key=LLM_API_KEY,
         temperature=0.0,
         timeout=10.0,
-        max_retries=2,
+        # Iteration 5: max_retries 2 -> 1 to bound the worst case. A call that
+        # exceeds the 10s timeout was retried up to 2x - each retry re-queues and
+        # re-prefills, stacking to ~30-40s and driving the latency max. One retry
+        # still rides out a transient blip but caps the tail.
+        max_retries=1,
         # Iteration 3: bound the decode budget per call. Outputs are short (a
         # single SELECT, or a one-line verdict); 512 is ample yet caps a runaway
         # generation from holding decode slots in the decode-bound batch.
@@ -179,8 +183,12 @@ async def verify_node(state: AgentState) -> dict:
     treated as "accept" rather than looping on a parse glitch.
     """
     result = state.execution
-    # Iteration 3: cap cell width so a wide-text result doesn't balloon the prompt.
-    result_text = result.render(max_cell=200) if result is not None else "ERROR: no execution result"
+    # Iteration 5: shrink the verify-path prefill. verify runs on EVERY request and
+    # re-prefills the (uncached) execution result; it only needs the answer's SHAPE
+    # - columns + a few representative values - to judge plausibility, not the full
+    # blob. Cap it hard here (3 rows x 80 chars); revise keeps the wider 200-char
+    # render since it has to see the data to fix the query.
+    result_text = result.render(max_rows=3, max_cell=80) if result is not None else "ERROR: no execution result"
 
     response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),
