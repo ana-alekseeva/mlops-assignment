@@ -1,54 +1,92 @@
 """Prompt templates for the agent nodes.
 
-These start as deliberate stubs. Filling them in (and calibrating them
-against the eval set) is part of the assignment.
+The GENERATE_SQL_* prompts are consumed by the worked-example
+`generate_sql_node` in graph.py via `.format(schema=..., question=...)`, so
+keep those placeholders intact. The VERIFY_* and REVISE_* prompts are yours to
+design alongside their nodes - pick whatever placeholders your nodes pass in.
 
-Notes:
-- The verify prompt is the hardest. Too strict and the loop never
-  terminates, too lenient and verify is decoration. Aim for it to fire
-  on the obvious failure modes (SQL errored, zero rows when the question
-  implies rows exist, columns that clearly don't answer the question).
-- For verify, force structured JSON output via response_format so you
-  can parse it deterministically.
-- For revise, pass the specific issue from verify - generic "try again"
-  prompts produce the same SQL.
+Only the *_USER templates are passed through str.format(), so they must contain
+only their intended {placeholders}. The *_SYSTEM templates are sent verbatim,
+which is why VERIFY_SYSTEM can include literal JSON braces safely.
+
+Filling these in is part of Phase 3.
 """
 
 GENERATE_SQL_SYSTEM = """\
-TODO: write the system prompt for SQL generation.
-The model should produce SQL ONLY, no explanation, no markdown fences.
-"""
+You are an expert data analyst who writes correct, executable SQLite queries.
 
+Rules:
+- Use ONLY the tables and columns that appear in the provided schema; never invent names.
+- Target the SQLite dialect.
+- Double-quote identifiers that are reserved words or contain spaces (e.g. "order").
+- Answer with a single SELECT statement that directly answers the question.
+- Return ONLY the SQL query - no explanation, no comments, no markdown fences."""
+
+# Available placeholders: {schema}, {question}
 GENERATE_SQL_USER = """\
-TODO: format the user message. Variables available:
-  {schema}   - rendered CREATE TABLE statements
-  {question} - the analyst's question
-"""
+Database schema:
+{schema}
+
+Question: {question}
+
+Write a single SQLite SELECT query that answers the question."""
 
 
 VERIFY_SYSTEM = """\
-TODO: write the verify system prompt. Demand strict JSON output:
-  {"ok": bool, "issue": "<short description, empty when ok>"}
-"""
+You are a meticulous QA reviewer for a text-to-SQL system. You are given a
+question, the SQL that was generated, and the result of executing that SQL.
+Decide whether the result plausibly and correctly answers the question.
 
+Mark the answer as NOT ok when, for example:
+- the query errored (the result starts with ERROR);
+- it returned zero rows but the question clearly implies at least one row should exist;
+- the returned columns do not answer what was asked (e.g. an id where a name was wanted);
+- the query obviously ignores a condition stated in the question (a filter, ordering, or limit).
+
+Be pragmatic: if the result is a reasonable answer to the question, mark it ok
+even if you would have phrased the SQL differently. Do not demand perfection.
+
+Respond with ONLY a single-line JSON object, no prose and no fences:
+{"ok": true, "issue": ""}
+or
+{"ok": false, "issue": "<one short sentence describing the problem>"}"""
+
+# Available placeholders: {question}, {sql}, {result}
 VERIFY_USER = """\
-TODO: format the user message. Variables available:
-  {question}
-  {sql}
-  {execution_result}  - ExecutionResult.render() output
-"""
+Question: {question}
+
+SQL:
+{sql}
+
+Execution result:
+{result}
+
+Return your JSON verdict."""
 
 
 REVISE_SYSTEM = """\
-TODO: write the revise system prompt.
-The model should rewrite the SQL, addressing the specific issue from verify.
-SQL only, no explanation, no fences.
-"""
+You are an expert SQLite engineer fixing a query that failed review. You are
+given the schema, the question, the previous query, its execution result, and
+the reviewer's complaint. Produce a corrected query that addresses the complaint.
 
+Rules:
+- Use ONLY the tables and columns in the schema; target the SQLite dialect.
+- Fix the specific problem the reviewer raised; do not rewrite gratuitously.
+- Return ONLY the corrected SQL query - no explanation, no markdown fences."""
+
+# Available placeholders: {schema}, {question}, {sql}, {result}, {issue}
 REVISE_USER = """\
-TODO: format the user message. Variables available:
-  {schema}
-  {question}
-  {prev_sql}
-  {issue}  - issue string from verify
-"""
+Database schema:
+{schema}
+
+Question: {question}
+
+Previous SQL:
+{sql}
+
+Result of the previous SQL:
+{result}
+
+Reviewer's complaint: {issue}
+
+Write a corrected SQLite SELECT query that fixes the problem."""

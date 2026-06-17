@@ -19,15 +19,14 @@ load_dotenv()
 
 from agent.graph import AgentState, graph  # noqa: E402
 
-# Langfuse callback handler (attached only when keys are present).
+# Langfuse callback handler. If keys are set we initialize it; failures
+# are NOT swallowed - a misconfigured Langfuse should not silently
+# produce zero traces.
 _lf_handler: Any = None
 if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
-    try:
-        from langfuse.callback import CallbackHandler
+    from langfuse.langchain import CallbackHandler
 
-        _lf_handler = CallbackHandler()
-    except Exception:  # noqa: BLE001
-        _lf_handler = None
+    _lf_handler = CallbackHandler()
 
 
 app = FastAPI()
@@ -53,12 +52,34 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _langfuse_metadata(req: AnswerRequest) -> dict[str, Any]:
+    """Map the caller's tags onto Langfuse's reserved keys.
+
+    The Langchain callback handler treats two metadata keys specially:
+    `langfuse_tags` becomes the filterable tag chips, and `langfuse_session_id`
+    groups a whole run into one session. Without this, plain `metadata=req.tags`
+    would only show up as trace metadata fields, never as tags or a session.
+
+    Each tag becomes a "key:value" chip (e.g. "run:iter11", "rps:10"); the raw
+    values are also kept as metadata so they stay queryable as structured fields.
+    """
+    metadata: dict[str, Any] = {
+        **req.tags,
+        "langfuse_tags": [f"{k}:{v}" for k, v in req.tags.items() if v],
+    }
+    # run/session_id/phase identifies one load-test or eval run -> one session.
+    session_id = req.tags.get("session_id") or req.tags.get("run") or req.tags.get("phase")
+    if session_id:
+        metadata["langfuse_session_id"] = session_id
+    return metadata
+
+
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
     config: dict[str, Any] = {
         "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": req.tags,
+        "metadata": _langfuse_metadata(req),
     }
     try:
         final = graph.invoke(state, config=config)

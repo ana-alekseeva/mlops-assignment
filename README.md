@@ -16,7 +16,7 @@ All in all you need to do two things:
   
 The endpoint will run on one H100, ain't much but honest hardware.
 
-![Farmer behind viral 'it ain't much, but it's honest work' meme dies in crash](https://cloudfront-us-east-1.images.arcpublishing.com/gray/FLBGRRRDQNHYBNTNHU4WOWRIFY.png)
+![Farmer](https://cloudfront-us-east-1.images.arcpublishing.com/gray/FLBGRRRDQNHYBNTNHU4WOWRIFY.png)
 
 Disclaimer:
 You don't need to set up Kubernetes, build a frontend or productionize past the toy-infra level. The point of the whole assignment is to learn what each layer tells you.
@@ -44,7 +44,7 @@ If done with curiosity, this assignment will bring you tons of knowledge about h
 
 -  **Hardware:** 1× H100
 
--  **Software:** Docker + docker-compose, Python, uv, git  
+-  **Software:** Docker + docker-compose, Python with `python3-dev` headers (vLLM's torch.compile path needs them), uv, git  
 
 ---
 
@@ -82,6 +82,9 @@ Once connected and forwarded, run the rest on the VM:
 # 1. Clone repo and install dependencies
 git clone <repo-url>
 cd <repo-folder>
+# System dep: Python dev headers, required for vLLM's torch.compile at startup
+# (without them it fails with: fatal error: Python.h: No such file or directory).
+sudo apt-get update && sudo apt-get install -y python3.12-dev
 uv sync
 
 # 2. Configure environment (Langfuse keys go here in Phase 4)
@@ -90,8 +93,9 @@ cp .env.example .env
 # 3. Load BIRD subset (~500 MB sqlite + JSONs)
 uv run python scripts/load_data.py
 
-# 4. Start the o11y stack
-docker compose up -d
+# 4. Start the o11y stack (needs Docker daemon access). Use sudo, or add yourself
+#    to the docker group once to skip it: sudo usermod -aG docker $USER && newgrp docker
+sudo docker compose up -d
 ```
 
 Sanity-check from your laptop browser:
@@ -120,14 +124,16 @@ If a URL doesn't load, the port forward is the most likely culprit.
 
 ## Phase 1 (vLLM)
 
-Imagine the minimal SLO your leadership can buy is something like this
+Imagine the minimal SLO your leadership can buy is something like this:
 
-> **P95 end-to-end agent latency under 5 seconds, sustained 8 user RPS, over a 5-minute window.**
+> **P95 end-to-end agent latency under 5 seconds, 10+ RPS (1rps = 1 full agent run per second) over a 5-minute window.**
 
 
-The model is fixed: `Qwen/Qwen3-30B-A3B-Instruct-2507`. The hardware is fixed: 1× H100 80GB. Everything else is up to you,  use your knowledge of fancy inference optimizations.
+The model is fixed: `Qwen/Qwen3-30B-A3B-Instruct-2507`. The hardware is fixed: 1× H100 80GB. Everything else is up to you, use your knowledge of inference optimizations.
 
 We are not enumerating which parameters to consider on purpose. Knowing which levers to reach for, given a workload profile (1.5-3K-token prompts, short structured outputs, ~2-3 dependent calls per user request) and a latency target, is the apply-the-lectures part of the assignment. Heads-up: you'll need to iterate.   
+
+There's an example launch script at `scripts/start_vllm.sh` to get you started - feel free to modify it or roll your own. The [vLLM docs](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html) are your reference for the available flags.
 
 ### What to do:
 1.  Start vLLM with your initial configuration.
@@ -139,11 +145,32 @@ We are not enumerating which parameters to consider on purpose. Knowing which le
 ### What you should have in the end:
 - vLLM serving Qwen3-30B-A3B at `http://localhost:8000`
 - A few manual queries returning sensible SQL
+- A screenshot of vLLM serving + one manual query returning SQL (`screenshots/vllm_manual_query.png`)
 - Your config flags + one-line justifications in `REPORT.md`
 
 ---
 
   
+
+## H100 is not needed all the time
+
+You don't have to occupy an H100 VM to make progress on every phase. The agent and the o11y stack talk to *any* OpenAI-compatible server, so you can build and debug against a lighter backend and switch to the real endpoint only when the numbers matter. Configure the backend via `VLLM_BASE_URL` / `VLLM_MODEL` / `OPENAI_API_KEY` in `.env` (see the commented block there). Consider two options:
+
+- Hosted API: point at e.g. OpenAI with a your own key. It exposes no Prometheus metrics though.
+- CPU-only vLLM: run vLLM on CPU with a small stand-in model like `Qwen/Qwen3-0.6B`. See the [CPU install docs](https://docs.vllm.ai/en/latest/getting_started/installation/cpu.html) for more details.
+
+What you can do off the H100:
+
+| Phase | Off-GPU? | Notes |
+|---|---|---|
+| 2 (Grafana) | CPU-vLLM only | Hosted APIs expose no `/metrics`. Build panels and confirm they react against a CPU vLLM; absolute numbers are unrepresentative. |
+| 3 (Agent) | Either | Pure graph / prompt wiring. |
+| 4 (Tracing) | Either | Langfuse captures the LangGraph spans regardless of backend. |
+| 5 (Evals) | Either | Validate the eval harness end-to-end; real pass rates must come from the 30B endpoint. |
+
+Anything you report e.g. eval pass rates, latency, the Phase 6 SLO must come from the real `Qwen3-30B-A3B` on the H100.
+
+---
 
 ## Phase 2 (o11y core)
 
@@ -159,9 +186,12 @@ Open the starter dashboard in Grafana and build it out to cover three categories
 
 We are not naming the specific metrics on purpose. Exploring `/metrics` and picking the right ones for each category is part of the work. Aim for a dashboard a teammate could open at 3 AM on a Friday night in a bar and read the picture.
 
+The starter dashboard at `infra/grafana/provisioning/dashboards/serving.json` gives you 2 pre-built panels to build on - feel free to extend it in the Grafana UI or edit the JSON directly. The [vLLM metrics docs](https://docs.vllm.ai/en/latest/usage/metrics.html) describe what each metric means, and the [Grafana docs](https://grafana.com/docs/grafana/latest/) are your reference for building panels.
+
 ### What you should have in the end:
 - Grafana dashboard covering latency, throughput, KV cache
 - Every panel visibly reacts when you fire requests
+- A screenshot of the full dashboard with panels reacting to a burst of requests (`screenshots/grafana_serving.png`)
 - Dashboard JSON committed under `infra/grafana/provisioning/dashboards/`
 
 ---
@@ -210,11 +240,13 @@ ok=false├──► ┌─────────────────┐
 
   
 
+> **Tip:** this phase is pure agent logic - you don't need the H100 running to build the graph and draft prompts. See [Developing without the H100](#developing-without-the-h100). Do final prompt tuning against the real `Qwen3-30B-A3B` endpoint, though - behavior and tokenization differ between models.
+
 ### What to do:
 
   
 
-1.  **Implement `generate_sql`, `verify`, `revise` nodes** in `agent/graph.py`. The `execute` node and helpers for rendering the DB schema as context are provided.
+1.  **Implement the LLM-calling nodes** in `agent/graph.py`. `generate_sql_node` is filled in as a worked example - `verify`, `revise`, and the `route_after_verify` router are yours, and each docstring spells out what the node must return. The mechanics (LLM client, graph wiring, `execute`, schema rendering) are scaffolded; the prompts and the verify/revise logic are the actual exercise.
 
 2.  **Write the prompts** in `agent/prompts.py`. Aim for it to fire on the obvious cases: SQL errored, zero rows when the question implies rows exist, returned columns clearly don't answer the question.
 
@@ -275,8 +307,9 @@ result = graph.invoke(state,  config={"callbacks": [handler]})
 
 ### What you should have in the end:
 - Langfuse capturing traces from agent runs
-- One trace inspected showing the `generate_sql` / `verify` / (sometimes) `revise` waterfall
+- One trace inspected showing the `generate_sql` / `verify` / (sometimes) `revise` waterfall (`screenshots/langfuse_trace.png`)
 - Traces tagged with metadata you'll filter on in Phase 6
+- A screenshot of the trace list with your metadata tags visible (`screenshots/langfuse_tags.png`)
 
 ---
 
@@ -307,6 +340,7 @@ The eval signal is execution accuracy: run the agent's final SQL and the gold SQ
 ### What you should have in the end:
 - `evals/run_eval.py` working end-to-end
 - `results/eval_baseline.json` with overall + per-iteration pass rates
+- A screenshot of the Grafana dashboard while the baseline eval runs (`screenshots/grafana_eval_run.png`)
 - A read on whether the agent loop is doing real work
   
 
@@ -317,7 +351,7 @@ The eval signal is execution accuracy: run the agent's final SQL and the gold SQ
 
 This is where the configuration from Phase 1 meets reality. The target is the platform SLO from Phase 1:
 
-> **P95 end-to-end agent latency under 5 seconds, sustained 8 user RPS, over a 5-minute window.**
+> **P95 end-to-end agent latency under 5 seconds, 10+ RPS (1rps = 1 full agent run per second) over a 5-minute window.**
 
  
 ### What to do:
@@ -327,7 +361,7 @@ This is where the configuration from Phase 1 meets reality. The target is the pl
 
 ```bash
 
-uv run python load_test/driver.py --rps 8 --duration 300
+uv run python load_test/driver.py --rps n --duration 300
 
 ```  
 
@@ -347,7 +381,7 @@ Watch the Grafana dashboard while it runs.
 
 ### What you should have in the end:
 - An iteration log in `REPORT.md` of the form *"saw X → hypothesized Y → changed Z → result was W"*
-- Grafana screenshots before/after each meaningful change
+- A before/after Grafana pair around the change that moved the needle (`screenshots/grafana_before.png`, `screenshots/grafana_after.png`)
 - `results/eval_after_tuning.json` showing whether quality survived
 - An honest verdict - SLO hit, or SLO missed with the gap quantified
 
@@ -385,5 +419,25 @@ By the end, your repo should contain:
 | `evals/run_eval.py` | Your eval runner |
 | `results/eval_baseline.json` | Baseline eval results |
 | `results/eval_after_tuning.json` | Post-tuning eval results |
-| `screenshots/grafana_serving.png` | The Grafana dashboard under load |
-| `screenshots/langfuse_trace.png` | A Langfuse trace showing a verify→revise loop |
+| `screenshots/vllm_manual_query.png` | vLLM serving + a manual query returning SQL (Phase 1) |
+| `screenshots/grafana_serving.png` | The full Grafana dashboard with panels reacting to load (Phase 2) |
+| `screenshots/langfuse_trace.png` | A Langfuse trace showing a verify→revise loop (Phase 4) |
+| `screenshots/langfuse_tags.png` | The Langfuse trace list with your metadata tags visible (Phase 4) |
+| `screenshots/grafana_eval_run.png` | The Grafana dashboard while the baseline eval runs (Phase 5) |
+| `screenshots/grafana_before.png`, `screenshots/grafana_after.png` | Before/after the tuning change that moved the needle (Phase 6) |
+
+---
+
+## Grading
+
+We want to see your thoughts and reasoning process, not the green checkmarks. Showing where you got stuck is better than omitting mentions of these points. A missed SLO with a metric-grounded diagnosis is better than a hit SLO you can't explain.
+
+| Area | Weight | What a strong submission shows |
+|---|---|---|
+| **Serving config & justification** (Phase 1) | 15% | vLLM serving Qwen3-30B-A3B on the H100, with flags chosen *for this workload* (not defaults) and a one-line rationale each that shows you understood the MoE / prompt-shape / latency tradeoffs. |
+| **Observability dashboard** (Phase 2) | 15% | Latency (percentiles), throughput, and KV-cache panels built from the right `/metrics`, that visibly react under load and actually answer "is it slow, and where in the request lifecycle?" Readable cold. |
+| **Agent design** (Phase 3) | 10% | `verify → revise` loop wired with an iteration cap, prompts that catch the obvious failure cases, and at least one question that genuinely triggers a revise. |
+| **Agent tracing** (Phase 4) | 5% | Langfuse capturing the `generate_sql / verify / (revise)` waterfall, with metadata tags you actually use in Phase 6. |
+| **Eval rigor** (Phase 5) | 15% | Correct execution-accuracy comparison (canonicalized row sets), overall + per-iteration pass rate, and an honest read on whether the loop earns its keep. |
+| **SLO diagnosis & iteration** (Phase 6) | 25% | A metric-grounded iteration log - *"saw X → hypothesized Y → changed Z → result W"* - with before/after evidence the targeted metric moved, and whether end-to-end latency *and* quality followed. Diagnosis quality counts more than hitting the number. |
+| **Report & communication** (Phase 7) | 15% | `REPORT.md` clear, honest about misses, ≤3 pages, and "what I'd do with more time" is specific (not "add Kubernetes"). |

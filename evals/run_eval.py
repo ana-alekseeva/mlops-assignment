@@ -42,12 +42,7 @@ def run_sql(db_id: str, sql: str, timeout: float = 5.0) -> tuple[bool, list[tupl
 
 
 def canonicalize(rows: list[tuple] | None) -> list[tuple] | None:
-    """Sort rows. Coerce cells to str. None -> ''.
-
-    This is intentionally forgiving: many text-to-SQL evals fail trivially
-    on row order or NULL representation. If your evaluation needs to be
-    stricter, tighten this.
-    """
+    """Sort rows; coerce cells to str; None -> ''."""
     if rows is None:
         return None
     return sorted(tuple("" if c is None else str(c) for c in row) for row in rows)
@@ -61,39 +56,124 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 # ---------- Implement these (Phase 5) ----------------------------------
 
-def eval_one(question: dict, agent_url: str) -> dict:
-    """TODO.
+def eval_one(question: dict, agent_url: str, run_label: str = "eval_baseline") -> dict:
+    """Score one question, capturing per-iteration correctness.
 
-    Per question:
-      1. Run the gold SQL against question["db_id"]. If it errors, mark
-         the question unscoreable (still record the result, but exclude
-         from pass-rate calculations).
-      2. POST to `agent_url` with body {"question": ..., "db": ...}.
-      3. From the response, take the per-iteration history and the final SQL.
-      4. For each iteration's SQL, run it and check whether its rows match
-         the gold rows (use matches()).
-      5. Return a dict including at minimum:
-           question, db_id, iterations, final_correct,
-           per_iteration: [{"iteration": int, "correct": bool, ...}, ...]
+    Calls the agent over HTTP, then reconstructs the SQL it held after each
+    generate/revise step from the returned `history`, executes each against
+    the target DB, and compares the canonicalized rows to the gold query's.
     """
-    raise NotImplementedError("Phase 5")
+    db_id = question["db_id"]
+    gold_sql = question.get("gold_sql", "")
+    q_text = question["question"]
+
+    # --- call the agent over HTTP ---
+    payload = {"question": q_text, "db": db_id, "tags": {"phase": "eval", "run": run_label, "db": db_id}}
+    t0 = time.monotonic()
+    try:
+        resp = httpx.post(agent_url, json=payload, timeout=180.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "db_id": db_id, "question": q_text, "gold_sql": gold_sql,
+            "final_sql": "", "final_correct": False,
+            "iterations": 0, "num_steps": 0, "per_iteration_correct": [],
+            "agent_ok": False, "agent_error": f"{type(e).__name__}: {e}",
+            "gold_error": None, "latency_s": round(time.monotonic() - t0, 3),
+        }
+    latency = round(time.monotonic() - t0, 3)
+
+    history = data.get("history") or []
+    final_sql = data.get("sql") or ""
+
+    # The SQL the agent held after each generate_sql / revise step, in order.
+    # history index k corresponds to the README's "iteration k".
+    step_sqls = [h["sql"] for h in history if h.get("node") in ("generate_sql", "revise") and h.get("sql")]
+    if not step_sqls and final_sql:
+        step_sqls = [final_sql]
+
+    # Gold executed once; reused for every comparison.
+    gold_ok, gold_rows, gold_err = run_sql(db_id, gold_sql)
+
+    def is_correct(sql: str) -> bool:
+        if not sql or not gold_ok:
+            return False
+        ok, rows, _ = run_sql(db_id, sql)
+        return ok and matches(gold_rows, rows)
+
+    per_iteration_correct = [is_correct(sql) for sql in step_sqls]
+    final_correct = (
+        is_correct(final_sql) if final_sql
+        else (per_iteration_correct[-1] if per_iteration_correct else False)
+    )
+
+    return {
+        "db_id": db_id,
+        "question": q_text,
+        "gold_sql": gold_sql,
+        "final_sql": final_sql,
+        "final_correct": final_correct,
+        "iterations": data.get("iterations", len(step_sqls)),
+        "num_steps": len(step_sqls),
+        "per_iteration_correct": per_iteration_correct,
+        "agent_ok": bool(data.get("ok", False)),
+        "agent_error": data.get("error"),
+        "gold_error": gold_err,
+        "latency_s": latency,
+    }
 
 
 def summarize(results: list[dict]) -> dict:
-    """TODO.
+    """Aggregate per-question results.
 
-    Compute:
-      - n: number of scoreable questions
-      - final_pass_rate: fraction with final_correct == True
-      - per_iteration_pass_rate: list of {"iteration": k, "pass_rate": f}
-        where pass_rate at k = fraction of questions whose iteration-k SQL
-        produced correct rows.
-
-    Why per-iteration matters: if iter 1 pass rate is the same as iter 3,
-    the verify+revise loop is doing nothing. If it climbs meaningfully,
-    the loop is earning its keep.
+    Per-iteration carry-forward: if the agent terminated at iteration j < k
+    (verify said ok at j, or it hit MAX_ITERATIONS at j < k), treat the
+    question's iteration-k result as identical to its iteration-j result.
+    The agent stopped emitting; whatever it had at termination is what
+    would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    if n == 0:
+        return {
+            "n": 0, "num_correct": 0, "overall_pass_rate": 0.0,
+            "pass_rate_by_iteration": {}, "iteration_distribution": {},
+            "questions_with_revision": 0, "agent_failures": 0, "avg_latency_s": 0.0,
+        }
+
+    num_correct = sum(1 for r in results if r["final_correct"])
+
+    # Horizon = the deepest iteration any question actually reached.
+    horizon = max((r["num_steps"] for r in results), default=1) or 1
+
+    pass_rate_by_iteration: dict[str, float] = {}
+    for k in range(horizon):
+        passed = 0
+        for r in results:
+            pi = r["per_iteration_correct"]
+            if not pi:
+                val = False
+            elif k < len(pi):
+                val = pi[k]
+            else:  # carry-forward: the agent had already terminated
+                val = pi[-1]
+            passed += 1 if val else 0
+        pass_rate_by_iteration[f"iter_{k}"] = round(passed / n, 4)
+
+    dist: dict[int, int] = {}
+    for r in results:
+        dist[r["num_steps"]] = dist.get(r["num_steps"], 0) + 1
+
+    return {
+        "n": n,
+        "num_correct": num_correct,
+        "overall_pass_rate": round(num_correct / n, 4),
+        "pass_rate_by_iteration": pass_rate_by_iteration,
+        "iteration_distribution": {str(k): dist[k] for k in sorted(dist)},
+        "questions_with_revision": sum(1 for r in results if r["num_steps"] > 1),
+        "agent_failures": sum(1 for r in results if r.get("agent_error")),
+        "avg_latency_s": round(sum(r.get("latency_s", 0.0) for r in results) / n, 3),
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
@@ -103,6 +183,11 @@ def main() -> None:
     parser.add_argument("--eval-set", type=Path, default=DEFAULT_EVAL_FILE)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT_FILE)
     parser.add_argument("--agent-url", default=AGENT_URL_DEFAULT)
+    parser.add_argument(
+        "--run-label",
+        default="eval_baseline",
+        help="Langfuse run/session tag, e.g. eval_baseline, eval_after_tuning",
+    )
     args = parser.parse_args()
 
     questions = [json.loads(line) for line in args.eval_set.read_text().splitlines() if line.strip()]
@@ -112,7 +197,7 @@ def main() -> None:
     t0 = time.monotonic()
     for i, q in enumerate(questions, 1):
         print(f"[{i}/{len(questions)}] {q['db_id']}: {q['question'][:60]}...", flush=True)
-        results.append(eval_one(q, args.agent_url))
+        results.append(eval_one(q, args.agent_url, args.run_label))
     elapsed = time.monotonic() - t0
 
     summary = summarize(results)

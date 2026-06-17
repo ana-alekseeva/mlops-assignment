@@ -1,10 +1,10 @@
 {
-  "title": "vLLM serving",
+  "title": "vLLM serving — core diagnostics",
   "uid": "vllm-serving",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 4,
   "refresh": "5s",
-  "tags": ["vllm", "starter"],
+  "tags": ["vllm", "serving"],
   "time": {
     "from": "now-30m",
     "to": "now"
@@ -20,24 +20,24 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Requests running",
-      "description": "Active requests being served by vLLM right now.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "title": "Latency (P95): E2E vs phase — queue / prefill / decode",
+      "description": "Where request time goes. e2e = full vLLM-call wall time (budget ~1.5s P95, since the agent makes 2-3 calls under a 5s SLO). decode is the cost center; fp8 weights + fp8-KV + FlashInfer + DeepGEMM all target it. prefill stays low because the shared system-prompt + DB-schema prefix is served from the prefix cache (--enable-prefix-caching) — confirm in the KV panel. A rising queue line means the scheduler can't admit requests (raise --max-num-seqs / --max-num-batched-tokens). These are independent P95s and do NOT sum to e2e.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "vllm:num_requests_running",
-          "legendFormat": "running"
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[5m])))", "legendFormat": "e2e p95" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[5m])))", "legendFormat": "queue p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket[5m])))", "legendFormat": "prefill p95" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:request_decode_time_seconds_bucket[5m])))", "legendFormat": "decode p95" }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "s",
           "custom": { "drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10 }
         },
-        "overrides": []
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "e2e p95" }, "properties": [ { "id": "custom.lineWidth", "value": 2 }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
       },
       "options": {
         "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
@@ -47,24 +47,79 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Generated tokens / sec",
-      "description": "Rate of output tokens produced by vLLM, smoothed over 1m.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "title": "Throughput — tokens/s (generation vs prompt) & req/s",
+      "description": "The headline serving rate. generation tok/s is the work the decode path produces; the fp8 weights + DeepGEMM MoE + FlashInfer changes are meant to lift it (cheaper tokens). prompt tok/s shows prefill load (mostly cache hits here, so low real compute). requests/s (right axis) is the sustained RPS — compare against the load target ÷ calls-per-request.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rate(vllm:generation_tokens_total[1m])",
-          "legendFormat": "gen tokens/s"
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:generation_tokens_total[1m]))", "legendFormat": "generation tok/s" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:prompt_tokens_total[1m]))", "legendFormat": "prompt tok/s" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:request_success_total[1m]))", "legendFormat": "requests/s" }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "short",
           "custom": { "drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10 }
         },
-        "overrides": []
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "requests/s" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "reqps" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } } ] }
+        ]
+      },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Batching & queue — running / waiting / batch fullness",
+      "description": "Is the scheduler keeping the batch full? running = sequences in the GPU batch (ceiling = --max-num-seqs 256); waiting = admitted but queued (no slot / no KV). tokens/step (right axis) = tokens processed per engine forward pass vs the --max-num-batched-tokens 8192 budget. If tokens/step sits far below 8192 WHILE waiting > 0, you're under-batching — raise --max-num-seqs / --max-num-batched-tokens. If running is flat at 256 or tokens/step pinned at 8192, you're batch-bound. --enable-chunked-prefill keeps a big prefill from starving decode here.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_running", "legendFormat": "running" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_waiting", "legendFormat": "waiting" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:iteration_tokens_total_bucket[5m])))", "legendFormat": "tokens/step p50" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10 }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "waiting" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byName", "options": "tokens/step p50" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "custom.axisLabel", "value": "tokens/step (≤ 8192)" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } } ] }
+        ]
+      },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "KV cache & prefix cache — headroom & reuse",
+      "description": "KV cache used = fraction of GPU KV blocks in use; --max-model-len 8192 + --kv-cache-dtype fp8 shrink the per-sequence reservation so more sequences fit (deeper batches). Yellow 0.85 / red 0.95 = no headroom → queueing/preemption. prefix hit rate = share of block lookups served from the prefix cache (--enable-prefix-caching); high means the system-prompt + schema prefix is being reused, which is why prefill latency is low. preemptions/s (right axis) should stay 0 — any sustained value means KV ran out and requests were evicted (reduce --max-num-seqs or context).",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:kv_cache_usage_perc", "legendFormat": "KV cache used" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:prefix_cache_hits_total[5m])) / clamp_min(sum(rate(vllm:prefix_cache_queries_total[5m])), 1)", "legendFormat": "prefix hit rate" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:num_preemptions_total[1m]))", "legendFormat": "preemptions/s" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10 }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "KV cache used" }, "properties": [ { "id": "custom.thresholdsStyle", "value": { "mode": "dashed" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.85 }, { "color": "red", "value": 0.95 } ] } } ] },
+          { "matcher": { "id": "byName", "options": "preemptions/s" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "short" }, { "id": "max", "value": null }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
       },
       "options": {
         "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
