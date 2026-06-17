@@ -5,14 +5,7 @@ The GENERATE_SQL_* prompts are consumed by the worked-example
 keep those placeholders intact. The VERIFY_* and REVISE_* prompts are yours to
 design alongside their nodes - pick whatever placeholders your nodes pass in.
 
-Only the *_USER templates are passed through str.format(), so they must contain
-only their intended {placeholders}. The *_SYSTEM templates are sent verbatim
-(never .format()'d), so they may contain literal braces safely.
-
-Phase 6 / iteration 6: these were tightened for concision - every functional
-rule kept, just fewer words. The system prompts sit in the cached prefix so the
-latency effect is marginal; the win is hygiene and a slightly smaller prefill on
-cache misses. Validated against the Phase 5 eval (no accuracy change).
+Filling these in is part of Phase 3.
 """
 
 GENERATE_SQL_SYSTEM = """\
@@ -54,10 +47,10 @@ and question follow afterward.
 
 - Return ONE SELECT that answers the question - SQL only, no prose, comments, or fences."""
 
-# Available placeholders: {schema}, {evidence}, {question}
+# Available placeholders: {schema}, {question}
 GENERATE_SQL_USER = """\
 Schema:
-{schema}{evidence}
+{schema}
 
 Question: {question}
 
@@ -73,8 +66,8 @@ e.g. needs COLLATE NOCASE); the SELECT returns extra or wrong columns instead of
 exactly what was asked (e.g. an id instead of a name, or many columns when one was
 asked); or a stated filter/order/limit is ignored.
 Be pragmatic - accept a reasonable answer even if you'd phrase the SQL differently.
-Reply with EXACTLY one of (no JSON, prose, or fences): the bare token OK if
-acceptable, else BAD: <one short sentence describing the problem>."""
+Reply with ONLY a compact JSON object, no prose or fences: {"ok": true} if
+acceptable, else {"ok": false, "issue": "<one short sentence describing the problem>"}."""
 
 # Available placeholders: {question}, {sql}, {result}
 VERIFY_USER = """\
@@ -86,7 +79,7 @@ SQL:
 Result:
 {result}
 
-Verdict (OK or BAD: ...):"""
+Verdict (JSON):"""
 
 
 REVISE_SYSTEM = """\
@@ -101,10 +94,10 @@ Rules:
 - Return only the column(s) the question asks for, nothing extra.
 - Return ONLY the corrected SELECT - no prose or fences."""
 
-# Available placeholders: {schema}, {evidence}, {question}, {sql}, {result}, {issue}
+# Available placeholders: {schema}, {question}, {sql}, {result}, {issue}
 REVISE_USER = """\
 Schema:
-{schema}{evidence}
+{schema}
 
 Question: {question}
 

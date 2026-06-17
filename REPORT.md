@@ -577,3 +577,9 @@ Two mistakes. (1) **The 503s ARE errors** — `agent_requests_total{outcome="rej
 
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._
+
+
+
+
+1. lru_cache in graph - lazy singleton, only one client is created and used fr every call
+2. async for generate_sql_node, async def execute_node, async def verify_node

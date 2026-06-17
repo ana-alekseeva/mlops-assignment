@@ -20,28 +20,15 @@ class ExecutionResult:
     error: str | None = None
     row_count: int = 0
 
-    def render(self, max_rows: int = 10, max_cell: int = 200) -> str:
-        """Compact text rendering for prompt context.
-
-        Phase 6 / iteration 3 (prompt & KV reduction): besides the 10-row cap,
-        each cell is now truncated to ``max_cell`` chars. The row cap alone left
-        cell *width* unbounded, so a single wide TEXT column (e.g. a post body or
-        a card's text) could push a verify/revise prompt to thousands of tokens.
-        The verifier only needs to see the *shape* of the answer (columns, a few
-        representative values), not full blobs, so this is a pure token win.
-        """
+    def render(self, max_rows: int = 10) -> str:
+        """Compact text rendering for prompt context."""
         if not self.ok:
             return f"ERROR: {self.error}"
         if self.row_count == 0:
             return "OK: 0 rows returned."
-
-        def cell(c: object) -> str:
-            s = str(c)
-            return s if len(s) <= max_cell else s[:max_cell] + f"…(+{len(s) - max_cell} chars)"
-
         cols = ", ".join(self.columns or [])
         preview = "\n".join(
-            " | ".join(cell(c) for c in row) for row in (self.rows or [])[:max_rows]
+            " | ".join(str(c) for c in row) for row in (self.rows or [])[:max_rows]
         )
         more = f"\n... ({self.row_count - max_rows} more rows)" if self.row_count > max_rows else ""
         return f"OK: {self.row_count} rows.\nCOLUMNS: {cols}\nFIRST ROWS:\n{preview}{more}"
