@@ -85,6 +85,7 @@ cd <repo-folder>
 # System dep: Python dev headers, required for vLLM's torch.compile at startup
 # (without them it fails with: fatal error: Python.h: No such file or directory).
 sudo apt-get update && sudo apt-get install -y python3.12-dev
+curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
 # 2. Configure environment (Langfuse keys go here in Phase 4)
@@ -342,6 +343,37 @@ The eval signal is execution accuracy: run the agent's final SQL and the gold SQ
 - `results/eval_baseline.json` with overall + per-iteration pass rates
 - A screenshot of the Grafana dashboard while the baseline eval runs (`screenshots/grafana_eval_run.png`)
 - A read on whether the agent loop is doing real work
+
+### Baseline eval results
+
+Run over all 30 questions in `evals/eval_set.jsonl`:
+
+| Metric | Value |
+| --- | --- |
+| Questions (n) | 30 |
+| Correct | 10 |
+| Overall pass rate | 33.33% |
+| Agent failures | 0 |
+| Avg latency | 0.885s |
+| Questions with revision | 12 |
+
+**Pass rate by iteration:**
+
+| Iteration | Pass rate |
+| --- | --- |
+| iter 0 | 30.00% |
+| iter 1 | 33.33% |
+| iter 2 | 33.33% |
+
+**Iteration distribution** (how many questions finished at each iteration count):
+
+| Iterations | Questions |
+| --- | --- |
+| 1 | 18 |
+| 2 | 5 |
+| 3 | 7 |
+
+The loop earns a little: pass rate rises from 30% (iter 0) to 33.33% (iter 1), i.e. one extra question fixed by the first revision. iter 1 → iter 2 is flat, so later revisions add nothing on this set.
   
 
 ---
@@ -384,6 +416,27 @@ Watch the Grafana dashboard while it runs.
 - A before/after Grafana pair around the change that moved the needle (`screenshots/grafana_before.png`, `screenshots/grafana_after.png`)
 - `results/eval_after_tuning.json` showing whether quality survived
 - An honest verdict - SLO hit, or SLO missed with the gap quantified
+
+### Baseline load test results
+
+`uv run python load_test/driver.py --rps 10 --duration 300`:
+
+| Metric | Value | SLO |
+| --- | --- | --- |
+| Requested RPS | 10.0 | 10+ |
+| Achieved RPS | 8.33 | 10+ ❌ |
+| Duration | 300s (360s wall clock) | |
+| Total requests | 3000 | |
+| OK | 702 (23.4%) | |
+| Timeouts | 1695 (56.5%) | |
+| Client errors | 602 (20.1%) | |
+| HTTP errors | 1 | |
+| Latency p50 | 57.24s | |
+| Latency p95 | 114.54s | < 5s ❌ |
+| Latency p99 | 118.81s | |
+| Latency max | 120.55s | |
+
+**Verdict: SLO missed, badly.** p95 is 114.54s against a 5s target — off by ~23×. Only 23% of requests succeeded; 56% timed out. The latency percentiles all cluster just under 120s (max 120.55s), which is the shape of requests piling up against a fixed client timeout rather than completing — the server can't drain the queue at 10 RPS, so requests sit until they expire. Achieved throughput (8.33 RPS) is below the offered load, confirming the system is saturated. This is the baseline to diagnose and tune against in the iterations below.
 
 ---
 
