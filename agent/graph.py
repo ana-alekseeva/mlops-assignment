@@ -16,10 +16,12 @@ conditional router following the same shape.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -55,13 +57,24 @@ class AgentState:
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
+@lru_cache(maxsize=1)
 def llm() -> ChatOpenAI:
-    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
+    """Shared chat client pointed at VLLM_BASE_URL (your local vLLM by default).
+
+    Iteration 1: cached as one instance for the whole process instead of built
+    per node call. A fresh ChatOpenAI opens a new httpx connection pool each
+    time, so the old per-call construction churned sockets across the 2-3 calls
+    per request and exhausted ephemeral ports under load (connection-reset
+    client errors). One pooled client fixes that; the bounded timeout + retries
+    stop a call stuck in vLLM's queue from hanging to the caller's 120s cap.
+    """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        timeout=10.0,
+        max_retries=2,
     )
 
 
@@ -82,17 +95,18 @@ def _extract_sql(text: str) -> str:
     return (fenced.group(1) if fenced else text).strip()
 
 
-def generate_sql_node(state: AgentState) -> dict:
+async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
     Build messages from the prompts, call the shared llm(), extract the SQL,
     and return only the state fields you changed. `iteration` is bumped here
     (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
 
-    This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
-    in prompts.py to make it produce real queries.
+    Iteration 1: async (`ainvoke`) so the request runs on the event loop, not a
+    bounded threadpool worker - the LLM call is I/O-bound on vLLM, so awaiting
+    it lets hundreds of requests progress concurrently.
     """
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
@@ -107,9 +121,14 @@ def generate_sql_node(state: AgentState) -> dict:
     }
 
 
-def execute_node(state: AgentState) -> dict:
-    """Provided. Runs the SQL and stores the result."""
-    return {"execution": execute_sql(state.db_id, state.sql)}
+async def execute_node(state: AgentState) -> dict:
+    """Provided. Runs the SQL and stores the result.
+
+    Iteration 1: the blocking sqlite call is offloaded to a worker thread
+    (`asyncio.to_thread`) so a slow query can't stall the event loop and freeze
+    every other in-flight request.
+    """
+    return {"execution": await asyncio.to_thread(execute_sql, state.db_id, state.sql)}
 
 
 def _parse_verdict(text: str) -> tuple[bool | None, str]:
@@ -131,7 +150,7 @@ def _parse_verdict(text: str) -> tuple[bool | None, str]:
     return None, text.strip()[:200]
 
 
-def verify_node(state: AgentState) -> dict:
+async def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
     Build messages from the VERIFY_* prompts, call llm(), parse a small
@@ -143,7 +162,7 @@ def verify_node(state: AgentState) -> dict:
     result = state.execution
     result_text = result.render() if result is not None else "ERROR: no execution result"
 
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),
         ("user", prompts.VERIFY_USER.format(
             question=state.question,
@@ -167,7 +186,7 @@ def verify_node(state: AgentState) -> dict:
     }
 
 
-def revise_node(state: AgentState) -> dict:
+async def revise_node(state: AgentState) -> dict:
     """Produce a revised SQL query given state.verify_issue and the prior attempt.
 
     Same shape as generate_sql_node, but the prompt carries the failing SQL,
@@ -177,7 +196,7 @@ def revise_node(state: AgentState) -> dict:
     result = state.execution
     result_text = result.render() if result is not None else "ERROR: no execution result"
 
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,
