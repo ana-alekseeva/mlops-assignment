@@ -9,6 +9,10 @@ Graph shape:
                                               ok=false ---+----> revise -> execute -> verify (loop)
 
 Loop is capped at MAX_ITERATIONS total generate/revise calls.
+
+The execute node and the graph wiring are provided. `generate_sql_node` is
+filled in as a worked example; you implement `verify`, `revise`, and the
+conditional router following the same shape.
 """
 from __future__ import annotations
 
@@ -28,8 +32,11 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
-MAX_ITERATIONS = 3
+# Iteration 3: lowered 3 -> 2 (1 generate + at most 1 revise). The eval pass
+# rate is flat across iterations (iter_0 == iter_2) - the 2nd revise spends a
+# 3rd serial vLLM call without recovering accuracy, so cutting it trims tail
+# work from the decode-bound path at ~no accuracy cost.
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -55,23 +62,37 @@ class AgentState:
 
 @lru_cache(maxsize=1)
 def llm() -> ChatOpenAI:
-    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
+    """Shared chat client pointed at VLLM_BASE_URL (your local vLLM by default).
 
+    Iteration 1: cached as one instance for the whole process instead of built
+    per node call. A fresh ChatOpenAI opens a new httpx connection pool each
+    time, so the old per-call construction churned sockets across the 2-3 calls
+    per request and exhausted ephemeral ports under load (connection-reset
+    client errors). One pooled client fixes that; the bounded timeout + retries
+    stop a call stuck in vLLM's queue from hanging to the caller's 120s cap.
+    """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
-        timeout=15.0,
-        max_retries=2,
-        max_tokens=128,
+        timeout=10.0,
+        # Iteration 5: max_retries 2 -> 1 to bound the worst case. A call that
+        # exceeds the 10s timeout was retried up to 2x - each retry re-queues and
+        # re-prefills, stacking to ~30-40s and driving the latency max. One retry
+        # still rides out a transient blip but caps the tail.
+        max_retries=1,
+        # Iteration 3: bound the decode budget per call. Outputs are short (a
+        # single SELECT, or a one-line verdict); 512 is ample yet caps a runaway
+        # generation from holding decode slots in the decode-bound batch.
+        max_tokens=512,
     )
 
 
 # ---- Nodes ------------------------------------------------------------
 
 def _attach_schema(state: AgentState) -> dict:
-    """Provided. Render the DB schema once per run."""
+    """Provided. Render the DB schema once at the start of the run."""
     return {"schema": render_schema(state.db_id)}
 
 
@@ -92,8 +113,9 @@ async def generate_sql_node(state: AgentState) -> dict:
     and return only the state fields you changed. `iteration` is bumped here
     (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
 
-    This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
-    in prompts.py to make it produce real queries.
+    Iteration 1: async (`ainvoke`) so the request runs on the event loop, not a
+    bounded threadpool worker - the LLM call is I/O-bound on vLLM, so awaiting
+    it lets hundreds of requests progress concurrently.
     """
     response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
@@ -113,11 +135,42 @@ async def generate_sql_node(state: AgentState) -> dict:
 async def execute_node(state: AgentState) -> dict:
     """Provided. Runs the SQL and stores the result.
 
-    The sqlite call can be blocking, so it is offloaded to a
-    worker thread (`asyncio.to_thread`) - otherwise a slow query (up to its 5s
-    timeout) would stall the event loop and freeze every other in-flight request.
+    Iteration 1: the blocking sqlite call is offloaded to a worker thread
+    (`asyncio.to_thread`) so a slow query can't stall the event loop and freeze
+    every other in-flight request.
     """
     return {"execution": await asyncio.to_thread(execute_sql, state.db_id, state.sql)}
+
+
+def _parse_verdict(text: str) -> tuple[bool | None, str]:
+    """Recover (ok, issue) from the verifier's reply, defensively.
+
+    Iteration 3: the verdict contract is the compact "OK" / "BAD: <issue>" form
+    (one token on the common accept path) instead of a JSON object - decode cost
+    scales with output tokens x concurrency, and verify runs on every request,
+    so trimming the happy verdict ~12 -> 1 token removes most of verify's decode
+    contribution without dropping the check. A JSON fallback is kept so an
+    old-style {"ok":..,"issue":..} reply still parses. Returns (None, snippet)
+    when no verdict can be recovered, so the caller picks a fallback.
+    """
+    t = text.strip()
+    low = t.lower()
+    if low.startswith("ok"):
+        return True, ""
+    if low.startswith("bad"):
+        # Drop the leading "BAD" and any ":"/"-"/space separator.
+        return False, t[3:].lstrip(" :-\t").strip()
+    # Backward-compatible fallback: a JSON object {"ok": bool, "issue": str}.
+    match = re.search(r"\{.*\}", t, re.DOTALL)
+    if match:
+        try:
+            obj = json.loads(match.group(0))
+            ok = obj.get("ok")
+            if isinstance(ok, bool):
+                return ok, str(obj.get("issue", "")).strip()
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return None, t[:200]
 
 
 async def verify_node(state: AgentState) -> dict:
@@ -130,6 +183,11 @@ async def verify_node(state: AgentState) -> dict:
     treated as "accept" rather than looping on a parse glitch.
     """
     result = state.execution
+    # Iteration 5: shrink the verify-path prefill. verify runs on EVERY request and
+    # re-prefills the (uncached) execution result; it only needs the answer's SHAPE
+    # - columns + a few representative values - to judge plausibility, not the full
+    # blob. Cap it hard here (3 rows x 80 chars); revise keeps the wider 200-char
+    # render since it has to see the data to fix the query.
     result_text = result.render(max_rows=3, max_cell=80) if result is not None else "ERROR: no execution result"
 
     response = await llm().ainvoke([
@@ -140,17 +198,9 @@ async def verify_node(state: AgentState) -> dict:
             result=result_text,
         )),
     ])
-
-    # Parse the verifier's JSON verdict {"ok": bool, "issue": str}. Default to
-    # accept on an unparseable reply, so a parse glitch on a successful run does
-    # not loop forever; a failed execution is forced to ok=False below regardless.
-    ok, issue = True, ""
-    try:
-        verdict = json.loads(response.content)
-        if isinstance(verdict.get("ok"), bool):
-            ok, issue = verdict["ok"], str(verdict.get("issue", ""))
-    except (json.JSONDecodeError, AttributeError):
-        pass
+    ok, issue = _parse_verdict(response.content)
+    if ok is None:
+        ok, issue = True, ""
 
     if result is None or not result.ok:
         ok = False
@@ -172,7 +222,7 @@ async def revise_node(state: AgentState) -> dict:
     specific problem. Bumps `iteration` so route_after_verify can terminate.
     """
     result = state.execution
-    result_text = result.render() if result is not None else "ERROR: no execution result"
+    result_text = result.render(max_cell=200) if result is not None else "ERROR: no execution result"
 
     response = await llm().ainvoke([
         ("system", prompts.REVISE_SYSTEM),

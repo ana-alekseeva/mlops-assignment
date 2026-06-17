@@ -75,14 +75,18 @@ def _langfuse_metadata(req: AnswerRequest) -> dict[str, Any]:
 
 
 @app.post("/answer", response_model=AnswerResponse)
-def answer(req: AnswerRequest) -> AnswerResponse:
+async def answer(req: AnswerRequest) -> AnswerResponse:
+    # Iteration 1: async endpoint + graph.ainvoke. The request runs on the event
+    # loop instead of Starlette's bounded (~40) threadpool, so the 2-3 I/O-bound
+    # vLLM calls per request no longer pin one OS thread for the whole chain -
+    # concurrency is bounded by the httpx pool and vLLM's batching, not 40 threads.
     state = AgentState(question=req.question, db_id=req.db)
     config: dict[str, Any] = {
         "callbacks": [_lf_handler] if _lf_handler is not None else [],
         "metadata": _langfuse_metadata(req),
     }
     try:
-        final = graph.invoke(state, config=config)
+        final = await graph.ainvoke(state, config=config)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 

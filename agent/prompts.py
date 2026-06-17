@@ -5,69 +5,49 @@ The GENERATE_SQL_* prompts are consumed by the worked-example
 keep those placeholders intact. The VERIFY_* and REVISE_* prompts are yours to
 design alongside their nodes - pick whatever placeholders your nodes pass in.
 
+Only the *_USER templates are passed through str.format(), so they must contain
+only their intended {placeholders}. The *_SYSTEM templates are sent verbatim,
+which is why VERIFY_SYSTEM can include literal JSON braces safely.
+
 Filling these in is part of Phase 3.
 """
 
 GENERATE_SQL_SYSTEM = """\
-You write correct, executable SQLite SELECT queries.
+You are an expert data analyst who writes correct, executable SQLite queries.
+
 Rules:
-- Use only tables/columns in the provided schema; never invent names.
-- SQLite dialect; double-quote reserved-word or spaced identifiers (e.g. "order").
-- Text filters: compare case-insensitively, because stored capitalization rarely
-  matches the question's wording and a wrong case returns zero rows. Use
-  `"col" = 'value' COLLATE NOCASE`.
-- SELECT exactly the column(s) the question asks for, in the order asked - nothing
-  extra. "List the names" -> just the name column; "how many" -> a single COUNT;
-  a which-one / yes-no question -> just that one answer column.
-- Add only the filters the question states; don't invent extra conditions.
-- Reach a value that lives in another table by joining on the foreign key, rather
-  than guessing it exists on the current table.
-- Match a specific date/time with LIKE 'prefix%' (e.g. WHERE "d" LIKE '2010-07-19%'),
-  not '=', because stored timestamps may carry a trailing '.0'.
-- Use SELECT DISTINCT when a join can duplicate rows but the question asks for
-  distinct entities or values.
-
-The examples below use a MADE-UP schema, only to show the style - your real schema
-and question follow afterward.
-
-  Schema (illustrative):
-    CREATE TABLE "movie" ("id" INTEGER PRIMARY KEY, "title" TEXT, "studio_id" INTEGER,
-      FOREIGN KEY ("studio_id") REFERENCES "studio"("id"));
-    CREATE TABLE "studio" ("id" INTEGER PRIMARY KEY, "name" TEXT, "country" TEXT);
-
-  Q: List the titles of movies made by the 'Pixar' studio.
-  A: SELECT m."title" FROM "movie" m JOIN "studio" s ON m."studio_id" = s."id"
-     WHERE s."name" = 'Pixar' COLLATE NOCASE;
-     -- only the asked column (title); filter value matched case-insensitively;
-     -- studio name reached via the FK join.
-
-  Q: How many studios are based in the 'usa'?
-  A: SELECT COUNT(*) FROM "studio" WHERE "country" = 'usa' COLLATE NOCASE;
-     -- a single COUNT; case-insensitive match means 'USA'/'usa'/'Usa' all count.
-
-- Return ONE SELECT that answers the question - SQL only, no prose, comments, or fences."""
+- Use ONLY the tables and columns that appear in the provided schema; never invent names.
+- Target the SQLite dialect.
+- Double-quote identifiers that are reserved words or contain spaces (e.g. "order").
+- Answer with a single SELECT statement that directly answers the question.
+- Return ONLY the SQL query - no explanation, no comments, no markdown fences."""
 
 # Available placeholders: {schema}, {question}
 GENERATE_SQL_USER = """\
-Schema:
+Database schema:
 {schema}
 
 Question: {question}
 
-Write one SQLite SELECT that answers it."""
+Write a single SQLite SELECT query that answers the question."""
 
 
 VERIFY_SYSTEM = """\
-You review a text-to-SQL result: given the question, the SQL, and its execution
-result, decide whether the result correctly answers the question.
-Reject when, for example: the result starts with ERROR; zero rows where the
-question implies at least one (often a text filter that should be case-insensitive,
-e.g. needs COLLATE NOCASE); the SELECT returns extra or wrong columns instead of
-exactly what was asked (e.g. an id instead of a name, or many columns when one was
-asked); or a stated filter/order/limit is ignored.
-Be pragmatic - accept a reasonable answer even if you'd phrase the SQL differently.
-Reply with ONLY a compact JSON object, no prose or fences: {"ok": true} if
-acceptable, else {"ok": false, "issue": "<one short sentence describing the problem>"}."""
+You are a meticulous QA reviewer for a text-to-SQL system. You are given a
+question, the SQL that was generated, and the result of executing that SQL.
+Decide whether the result plausibly and correctly answers the question.
+
+Mark the answer as NOT ok when, for example:
+- the query errored (the result starts with ERROR);
+- it returned zero rows but the question clearly implies at least one row should exist;
+- the returned columns do not answer what was asked (e.g. an id where a name was wanted);
+- the query obviously ignores a condition stated in the question (a filter, ordering, or limit).
+
+Be pragmatic: if the result is a reasonable answer to the question, mark it ok
+even if you would have phrased the SQL differently. Do not demand perfection.
+
+Reply with EXACTLY one of (no JSON, prose, or fences): the bare token OK if
+acceptable, else BAD: <one short sentence describing the problem>."""
 
 # Available placeholders: {question}, {sql}, {result}
 VERIFY_USER = """\
@@ -76,27 +56,25 @@ Question: {question}
 SQL:
 {sql}
 
-Result:
+Execution result:
 {result}
 
-Verdict (JSON):"""
+Verdict (OK or BAD: ...):"""
 
 
 REVISE_SYSTEM = """\
-You fix a SQLite query that failed review, given the schema, question, previous
-query, its result, and the reviewer's complaint.
+You are an expert SQLite engineer fixing a query that failed review. You are
+given the schema, the question, the previous query, its execution result, and
+the reviewer's complaint. Produce a corrected query that addresses the complaint.
+
 Rules:
-- Use only schema tables/columns; SQLite dialect.
-- Fix the specific complaint; do not rewrite gratuitously.
-- If the result was empty, suspect a text filter and make it case-insensitive
-  with COLLATE NOCASE.
-- Use only columns that exist in the schema; do not invent column names.
-- Return only the column(s) the question asks for, nothing extra.
-- Return ONLY the corrected SELECT - no prose or fences."""
+- Use ONLY the tables and columns in the schema; target the SQLite dialect.
+- Fix the specific problem the reviewer raised; do not rewrite gratuitously.
+- Return ONLY the corrected SQL query - no explanation, no markdown fences."""
 
 # Available placeholders: {schema}, {question}, {sql}, {result}, {issue}
 REVISE_USER = """\
-Schema:
+Database schema:
 {schema}
 
 Question: {question}
@@ -104,9 +82,9 @@ Question: {question}
 Previous SQL:
 {sql}
 
-Its result:
+Result of the previous SQL:
 {result}
 
-Complaint: {issue}
+Reviewer's complaint: {issue}
 
-Return a corrected SQLite SELECT that fixes it."""
+Write a corrected SQLite SELECT query that fixes the problem."""

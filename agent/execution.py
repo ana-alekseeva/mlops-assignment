@@ -20,15 +20,29 @@ class ExecutionResult:
     error: str | None = None
     row_count: int = 0
 
-    def render(self, max_rows: int = 10) -> str:
-        """Compact text rendering for prompt context."""
+    def render(self, max_rows: int = 10, max_cell: int | None = None) -> str:
+        """Compact text rendering for prompt context.
+
+        Iteration 3: `max_cell` caps each cell's width with a `…(+N chars)`
+        marker. The verify/revise prompts ballooned on wide-text columns (a
+        `SELECT *` blob could be ~3k tokens) - the verifier only needs the
+        answer's shape, not the full blob, so capping cells trims those
+        pathological prompts at no information cost to the check.
+        """
         if not self.ok:
             return f"ERROR: {self.error}"
         if self.row_count == 0:
             return "OK: 0 rows returned."
         cols = ", ".join(self.columns or [])
+
+        def cell(c: object) -> str:
+            s = str(c)
+            if max_cell is not None and len(s) > max_cell:
+                return f"{s[:max_cell]}…(+{len(s) - max_cell} chars)"
+            return s
+
         preview = "\n".join(
-            " | ".join(str(c) for c in row) for row in (self.rows or [])[:max_rows]
+            " | ".join(cell(c) for c in row) for row in (self.rows or [])[:max_rows]
         )
         more = f"\n... ({self.row_count - max_rows} more rows)" if self.row_count > max_rows else ""
         return f"OK: {self.row_count} rows.\nCOLUMNS: {cols}\nFIRST ROWS:\n{preview}{more}"
