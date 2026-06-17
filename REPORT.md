@@ -575,6 +575,23 @@ Two mistakes. (1) **The 503s ARE errors** — `agent_requests_total{outcome="rej
 
 **Result — pending the next load run.** Expected: agent end-to-end latency returns to the ~4 s P95 floor (verify cap + lighter tracing pulling it slightly under), `http_errors` back to **0** (no 503 path), and `client_errors`/`timeouts` toward 0 as the event loop stops falling behind. Re-run `--rps 10 --duration 300`; confirm via the Prometheus split that the agent-vs-vLLM gap has closed and the `outcome` breakdown shows only `ok`/`agent_error` (no `rejected`). Validate accuracy unchanged (`evals/run_eval.py`). If P95 still drifts up under load, the next *non-shedding* lever is structural concurrency on the agent (multiple uvicorn workers with Prometheus multiprocess mode) so orchestration CPU spreads across cores — explicitly preferred over any form of load rejection.
 
+### Iteration 12 — kill the timeout tail with multi-worker concurrency (no shedding)
+
+**Saw — a small but stubborn timeout tail at the healthy operating point.** A `--rps 11 --duration 300` run was clean on every latency band yet still lost 10 requests to timeouts:
+
+```json
+{ "achieved_rps": 9.78, "ok": 3290, "timeouts": 10, "http_errors": 0, "client_errors": 0,
+  "latency_p50": 0.94, "latency_p95": 5.09, "latency_p99": 11.9, "latency_max": 35.3 }
+```
+
+The tell is the gap between `latency_max` (**35 s**, computed over *successful* requests) and the driver's per-request ceiling (`aiohttp.ClientTimeout(total=120)`). The 10 timeouts are not "a bit slow" — they are stuck **past 120 s**, far beyond anything that completed. That is not vLLM (iter-11: 0 waiting, 0 preemptions, TTFT 36 ms) and not the per-call budget (10 s timeout × 1 retry × ~4 calls ≈ 80 s absolute worst). It is **event-loop starvation**: the agent is a *single* asyncio loop doing ~27 vLLM round-trips/s of orchestration CPU (response parse + LangGraph state + Langfuse spans) on one core. When that loop falls behind, its timers — including the 10 s per-call timeout meant to fail fast — fire *late*, so a few unlucky requests never get cut and pile to >120 s. iter-11 named this exact lever as the next non-shedding move.
+
+**Changed — multiple uvicorn workers (graph logic + prompts untouched → accuracy unaffected).**
+- **(concurrency)** [`scripts/start_agent.sh`](scripts/start_agent.sh): launch with `--workers 4` (env `AGENT_WORKERS`). Four event loops on four cores means a CPU stall in one worker delays only its own ~1/N of in-flight requests instead of all of them, so no single loop falls 120 s behind. 4 leaves vLLM (4–15) and the o11y stack (0–3) their cores. **No request is rejected** — this adds parallel servers, it does not shed load (contrast iter-11's reverted 503 path).
+- **(metrics correctness)** [`agent/server.py`](agent/server.py): with >1 worker each process keeps its own in-memory counters, so a plain scrape would expose only the one worker that answered it. Switched the agent `/metrics` to Prometheus **multiprocess mode** — `PROMETHEUS_MULTIPROC_DIR` (set + cleaned by the start script) makes the scrape aggregate every worker's mmapped metric files into one view, and the in-flight gauge uses `multiprocess_mode="livesum"` so concurrency sums across workers. Workers `mark_process_dead` on shutdown so a finished run doesn't leave a stale in-flight contribution. The SLO histogram / outcome counters / Grafana panels stay correct.
+
+**Result — pending the next load run.** Expected: `timeouts` → **0** (no loop stays starved long enough to blow the 120 s ceiling), `latency_max` drops from the >120 s stuck tail toward the ~35 s real worst case, and P50/P95/P99 hold (the system was already healthy in those bands). Re-run `scripts/start_agent.sh` then `--rps 11 --duration 300`; confirm the agent `/metrics` still reports one aggregated series per metric (multiprocess working), and `agent_inflight_requests` now peaks across workers rather than pinning one loop. Re-confirm accuracy unchanged via `evals/run_eval.py` (nothing in the graph or prompts moved).
+
 ## Phase 7 — Wrap-up
 _TODO: final numbers, whether quality survived, what I'd do with more time._
 
