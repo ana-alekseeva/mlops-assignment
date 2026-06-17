@@ -15,11 +15,30 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 # Model id comes from .env (VLLM_MODEL) so the server and the agent always use the
-# same model. Switch hardware by switching VLLM_MODEL in .env:
-#   - L40S 48GB (dev):   Qwen/Qwen3-30B-A3B-Instruct-2507-FP8  (fp8,  ~30GB)
-#   - H100 80GB (final): Qwen/Qwen3-30B-A3B-Instruct-2507      (bf16, ~61GB, spec metrics)
+# same model. Switch precision by switching VLLM_MODEL in .env:
+#   - FP8  (chosen, iteration 4): Qwen/Qwen3-30B-A3B-Instruct-2507-FP8  (~30GB)
+#   - bf16 (A/B baseline):        Qwen/Qwen3-30B-A3B-Instruct-2507      (~61GB)
+# Iteration 4: at 100% util on a shallow batch the only lever is cheaper tokens.
+# fp8 weights halve the per-step MoE expert-weight HBM read AND run on Hopper's
+# fp8 tensor cores (~2x bf16) - it attacks the diagnosed bottleneck directly.
 # vLLM auto-detects fp8 from the checkpoint config - no quantization flag needed.
-MODEL="${VLLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
+# Default aligned to FP8 so an entry point that misses .env can't silently 404.
+MODEL="${VLLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}"
+
+# Tier-1 kernels (iteration 4): make each generation token cheaper.
+# (FlashInfer attention) faster Hopper decode + fp8-KV attention kernels than the
+# default backend; flashinfer-python is installed. Opt out: VLLM_ATTENTION_BACKEND=<x>.
+export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
+# (DeepGEMM MoE) grouped fp8 GEMM for the experts - faster than the default
+# Triton fused-MoE on Hopper for this 3B-active MoE, and only meaningful with fp8
+# weights. Auto-enabled IFF the deep_gemm kernels are importable (not installed by
+# default; until then vLLM falls back to Triton, which is safe and correct).
+# Force on/off explicitly with VLLM_USE_DEEP_GEMM=1/0.
+if [[ -z "${VLLM_USE_DEEP_GEMM:-}" ]] && \
+   uv run python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('deep_gemm') else 1)" 2>/dev/null; then
+    export VLLM_USE_DEEP_GEMM=1
+fi
+echo "Tier-1 kernels: attention=$VLLM_ATTENTION_BACKEND deep_gemm=${VLLM_USE_DEEP_GEMM:-0} model=$MODEL"
 
 # --max-num-batched-tokens 8192 (iteration 2): the per-step token budget the
 # scheduler fills from the running batch. Left unset it defaults low (~2048 with
