@@ -32,8 +32,11 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
-MAX_ITERATIONS = 3
+# Iteration 3: lowered 3 -> 2 (1 generate + at most 1 revise). The eval pass
+# rate is flat across iterations (iter_0 == iter_2) - the 2nd revise spends a
+# 3rd serial vLLM call without recovering accuracy, so cutting it trims tail
+# work from the decode-bound path at ~no accuracy cost.
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -75,6 +78,10 @@ def llm() -> ChatOpenAI:
         temperature=0.0,
         timeout=10.0,
         max_retries=2,
+        # Iteration 3: bound the decode budget per call. Outputs are short (a
+        # single SELECT, or a one-line verdict); 512 is ample yet caps a runaway
+        # generation from holding decode slots in the decode-bound batch.
+        max_tokens=512,
     )
 
 
@@ -132,13 +139,25 @@ async def execute_node(state: AgentState) -> dict:
 
 
 def _parse_verdict(text: str) -> tuple[bool | None, str]:
-    """Pull {"ok": bool, "issue": str} out of an LLM reply, defensively.
+    """Recover (ok, issue) from the verifier's reply, defensively.
 
-    The model is asked for a bare JSON object, but may wrap it in prose or
-    fences. Grab the first {...} span and parse it. Returns (None, snippet)
-    when no boolean verdict can be recovered, so the caller picks a fallback.
+    Iteration 3: the verdict contract is the compact "OK" / "BAD: <issue>" form
+    (one token on the common accept path) instead of a JSON object - decode cost
+    scales with output tokens x concurrency, and verify runs on every request,
+    so trimming the happy verdict ~12 -> 1 token removes most of verify's decode
+    contribution without dropping the check. A JSON fallback is kept so an
+    old-style {"ok":..,"issue":..} reply still parses. Returns (None, snippet)
+    when no verdict can be recovered, so the caller picks a fallback.
     """
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    t = text.strip()
+    low = t.lower()
+    if low.startswith("ok"):
+        return True, ""
+    if low.startswith("bad"):
+        # Drop the leading "BAD" and any ":"/"-"/space separator.
+        return False, t[3:].lstrip(" :-\t").strip()
+    # Backward-compatible fallback: a JSON object {"ok": bool, "issue": str}.
+    match = re.search(r"\{.*\}", t, re.DOTALL)
     if match:
         try:
             obj = json.loads(match.group(0))
@@ -147,7 +166,7 @@ def _parse_verdict(text: str) -> tuple[bool | None, str]:
                 return ok, str(obj.get("issue", "")).strip()
         except (json.JSONDecodeError, AttributeError):
             pass
-    return None, text.strip()[:200]
+    return None, t[:200]
 
 
 async def verify_node(state: AgentState) -> dict:
@@ -160,7 +179,8 @@ async def verify_node(state: AgentState) -> dict:
     treated as "accept" rather than looping on a parse glitch.
     """
     result = state.execution
-    result_text = result.render() if result is not None else "ERROR: no execution result"
+    # Iteration 3: cap cell width so a wide-text result doesn't balloon the prompt.
+    result_text = result.render(max_cell=200) if result is not None else "ERROR: no execution result"
 
     response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),
@@ -194,7 +214,7 @@ async def revise_node(state: AgentState) -> dict:
     specific problem. Bumps `iteration` so route_after_verify can terminate.
     """
     result = state.execution
-    result_text = result.render() if result is not None else "ERROR: no execution result"
+    result_text = result.render(max_cell=200) if result is not None else "ERROR: no execution result"
 
     response = await llm().ainvoke([
         ("system", prompts.REVISE_SYSTEM),

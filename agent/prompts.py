@@ -46,10 +46,8 @@ Mark the answer as NOT ok when, for example:
 Be pragmatic: if the result is a reasonable answer to the question, mark it ok
 even if you would have phrased the SQL differently. Do not demand perfection.
 
-Respond with ONLY a single-line JSON object, no prose and no fences:
-{"ok": true, "issue": ""}
-or
-{"ok": false, "issue": "<one short sentence describing the problem>"}"""
+Reply with EXACTLY one of (no JSON, prose, or fences): the bare token OK if
+acceptable, else BAD: <one short sentence describing the problem>."""
 
 # Available placeholders: {question}, {sql}, {result}
 VERIFY_USER = """\
@@ -61,7 +59,7 @@ SQL:
 Execution result:
 {result}
 
-Return your JSON verdict."""
+Verdict (OK or BAD: ...):"""
 
 
 REVISE_SYSTEM = """\
